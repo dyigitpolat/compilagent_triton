@@ -22,8 +22,14 @@ class WorkloadRegistry:
         self._specs: dict[str, WorkloadSpec] = {}
         self._builders: dict[str, WorkloadBuilder] = {}
 
-    def register(self, spec: WorkloadSpec, builder: WorkloadBuilder) -> None:
-        if spec.id in self._specs:
+    def register(
+        self,
+        spec: WorkloadSpec,
+        builder: WorkloadBuilder,
+        *,
+        replace: bool = False,
+    ) -> None:
+        if spec.id in self._specs and not replace:
             raise ValueError(f"Workload `{spec.id}` is already registered.")
         self._specs[spec.id] = spec
         self._builders[spec.id] = builder

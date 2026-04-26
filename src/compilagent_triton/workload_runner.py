@@ -773,6 +773,41 @@ class WorkloadSession:
                 best = sp
         return best
 
+    def summary(self) -> dict[str, Any]:
+        """Structured rollup of the run, used by the API and exit handlers."""
+
+        best_id: str | None = None
+        best_sp: float | None = None
+        best_med: float | None = None
+        best_corr: bool | None = None
+        best_diff: float | None = None
+        for cid, c in self.candidates.items():
+            sp = c.get("speedup")
+            if sp is None:
+                continue
+            if best_sp is None or sp > best_sp:
+                best_sp = sp
+                best_id = cid
+                timing = c.get("timing")
+                best_med = timing.median_ms if timing else None
+                corr = c.get("correctness")
+                best_corr = corr.ok if corr else None
+                best_diff = corr.max_abs_diff if corr else None
+        return {
+            "run_id": self.run_id,
+            "workload_id": self.spec.id,
+            "backend_id": self.backend.id,
+            "baseline_median_ms": self.baseline_time.median_ms,
+            "best_speedup": best_sp,
+            "best_candidate_id": best_id,
+            "best_median_ms": best_med,
+            "best_correctness_ok": best_corr,
+            "best_max_abs_diff": best_diff,
+            "successful_count": self.budget_state["successful_count"],
+            "failed_attempts": self.budget_state["failed_attempts"],
+            "max_candidates": self.max_candidates,
+        }
+
 
 # ---------------------------------------------------------------------------
 # pydantic-ai harness
@@ -887,9 +922,8 @@ async def _run_pydantic_ai(
         },
     )
     return {
-        "run_id": run_id,
+        **session.summary(),
         "elapsed_ms": elapsed_ms,
-        "best_speedup": session.best_speedup(),
         "final_text": final_text,
     }
 
@@ -1168,9 +1202,8 @@ async def _run_claude_sdk(
         },
     )
     return {
-        "run_id": run_id,
+        **session.summary(),
         "elapsed_ms": elapsed_ms,
-        "best_speedup": session.best_speedup(),
         "final_text": final_text,
     }
 

@@ -1,6 +1,109 @@
 # Compilagent Triton
 
-Compilagent Triton is a top-level integration package for building an ACP environment around Triton compiler optimization experiments.
+Agentic compiler optimization for PyTorch + Triton. Drop-in replacement for `torch.compile` / `@triton.jit` that runs an LLM-driven search over **real compiler heuristics** (MLIR pass pipeline, Inductor scheduler decisions, FX rewrites, lowering registry overrides) — not user-tunable knobs like `BLOCK_SIZE` or `num_warps`.
+
+## Quickstart — 3 lines to optimize an existing PyTorch module
+
+```python
+import torch
+import compilagent_triton as cgt
+
+model = MyTransformerBlock().cuda().eval()      # any nn.Module
+example_inputs = (torch.randn(8, 197, 768, device="cuda", dtype=torch.bfloat16),)
+
+result = cgt.optimize_module(model, example_inputs, max_candidates=8)
+print(f"{result.best_speedup:.3f}× speedup over torch.compile baseline")
+print(f"correctness within tolerance: {result.correctness_ok}")
+```
+
+That's it. The agent compiles a baseline through `torch.compile`, derives a search space from the FX graph + Inductor knob catalog, proposes multi-knob candidates (e.g. `shape_padding + max_autotune + coordinate_descent_tuning`), benchmarks each, validates correctness against the baseline output, and returns the winner.
+
+## Quickstart — Triton kernel
+
+```python
+import torch, triton, triton.language as tl
+import compilagent_triton as cgt
+
+@triton.jit
+def my_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) +
+                              tl.load(y_ptr + offs, mask=mask), mask=mask)
+
+n = 1 << 20
+x, y = torch.randn(n, device="cuda"), torch.randn(n, device="cuda")
+out = torch.empty_like(x)
+
+result = cgt.optimize_kernel(
+    my_kernel,
+    args=(x, y, out, n),
+    grid=lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),),
+    constexpr={"BLOCK_SIZE": 1024},
+    max_candidates=8,
+)
+print(f"{result.best_speedup:.3f}× over the Triton-default pass pipeline")
+```
+
+The agent operates on the MLIR pass pipeline (`tritongpu-coalesce`, `-accelerate-matmul`, `-pipeline`, `-optimize-thread-locality`, etc.) — skipping, reordering, parameterizing passes — never on `BLOCK_SIZE` or `num_warps` (those are user inputs, not compiler decisions).
+
+## Configuration
+
+`compilagent_triton` reads settings from `.env`. Minimum:
+
+```bash
+ANTHROPIC_API_KEY=...                # or MISTRAL_API_KEY / OPENAI_API_KEY
+COMPILAGENT_MODEL=anthropic:claude-opus-4-7
+```
+
+Pass `model_name=` and `harness=` directly to override per-call:
+
+```python
+cgt.optimize_module(
+    model, example_inputs,
+    max_candidates=12,
+    model_name="mistral:mistral-large-latest",
+    harness="claude_agent_sdk",          # or "pydantic_ai" (default)
+)
+```
+
+## How it works
+
+1. **Baseline** — your callable is compiled through its native backend (`torch.compile` for `nn.Module`, `triton.JITFunction.__getitem__` for kernels) and timed with CUDA events.
+2. **Analysis** — the backend introspects the produced artifacts: FX graph + Inductor `output_code.py` + scheduler / fusion logs (PyTorch path), or TTGIR + per-pass IR diffs (Triton path).
+3. **Search-space derivation** — a backend-specific plugin set produces a list of *levers* with auto-bounded ranges and `evidence` tags linking each lever to a signal in the IR. No hand-coded knob list anywhere.
+4. **Agent loop** — the agent inspects the workload + search space, forms named hypotheses, registers multi-knob candidates as a batch, runs them, reads correctness + speedup back, synthesizes across the batch, and proposes the next batch. Failed compiles don't count against the budget.
+5. **Validation** — every reported speedup is verified by running the candidate's compiled output against the baseline output under per-dtype tolerances. Drift outside tolerance is treated as a failed candidate.
+
+## Effectiveness study
+
+A reproducible study driver lives in `scripts/experiments/`. It sweeps:
+
+  - harnesses (`pydantic_ai`, `claude_agent_sdk`),
+  - workloads (`vit_block`, `vector_add`),
+  - trial budgets (`4`, `8`, `12`, `16`, `20`),
+  - 3 RNG seeds each — for mean ± stddev error bars.
+
+```bash
+# Run the full grid (60 cells; takes a while)
+env/bin/python scripts/experiments/run_study.py
+
+# Or smoke-test the pipeline
+env/bin/python scripts/experiments/run_study.py --quick
+
+# Plot:
+env/bin/python scripts/experiments/plot_study.py runs/study/<timestamp>/results.jsonl
+```
+
+The plotter writes four PNGs:
+
+- `speedup_vs_trials.png` — best speedup vs trial budget
+- `correctness_rate.png` — fraction of seeds where the *independent* recheck passed and the speedup beat 1.0
+- `successful_per_trial.png` — successful_count / max_candidates (budget efficiency)
+- `elapsed_vs_trials.png` — wall-clock per run
+
+## Project layout
 
 The project keeps upstream submodules (`acpkit`, `triton`, and `code-mode`) as source references by default. New integration code lives under `src/compilagent_triton`; only edit submodules when a public hook, adapter, or plugin surface is insufficient.
 

@@ -1,5 +1,10 @@
-"""Agentic Triton compiler optimization environment."""
+"""Agentic Triton + TorchInductor compiler optimization environment."""
 
+from .api import (
+    OptimizationResult,
+    optimize_kernel,
+    optimize_module,
+)
 from .schemas import (
     BenchmarkResult,
     CandidateConfig,
@@ -19,5 +24,8 @@ __all__ = [
     "DecisionTrace",
     "KernelSpec",
     "OptimizationEpisode",
+    "OptimizationResult",
     "OptimizationWorkspace",
+    "optimize_kernel",
+    "optimize_module",
 ]
