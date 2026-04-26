@@ -1,0 +1,521 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import subprocess
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from .episodes import EpisodeStore
+from .events import ObservationEvent, redact
+from .examples import (
+    RunRequest,
+    create_run_id,
+    get_example,
+    list_examples,
+    preview_source,
+    run_registered_example,
+)
+from .trace_store import TraceStore
+from .workspace import OptimizationWorkspace
+
+UI_DIR = Path(__file__).with_name("observer_ui")
+
+
+def create_app(*, workspace_root: Path | None = None) -> FastAPI:
+    root = (workspace_root or (Path.cwd() / ".compilagent-triton")).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    trace_store = TraceStore(root).ensure()
+    workspace = OptimizationWorkspace(root.parent, root.name).ensure()
+    app = FastAPI(title="Compilagent Triton Observer")
+    app.state.workspace_root = root
+    app.state.trace_store = trace_store
+    app.state.workspace = workspace
+    app.state.runs = {}
+    app.state.active_run_id = None
+
+    if UI_DIR.exists():
+        app.mount("/assets", StaticFiles(directory=UI_DIR), name="assets")
+
+    @app.get("/")
+    def index() -> FileResponse:
+        index_path = UI_DIR / "index.html"
+        if not index_path.exists():
+            raise HTTPException(status_code=404, detail="observer UI is missing")
+        return FileResponse(index_path)
+
+    @app.get("/api/sessions")
+    def sessions() -> dict[str, Any]:
+        events = trace_store.read_events()
+        session_ids = sorted({event.session_id for event in events if event.session_id})
+        episode_ids = sorted({event.episode_id for event in events if event.episode_id})
+        return {"sessions": session_ids, "episodes": episode_ids, "event_count": len(events)}
+
+    @app.get("/api/events")
+    def events(
+        session_id: str | None = None,
+        episode_id: str | None = None,
+        after: str | None = None,
+        limit: int = Query(default=500, ge=0, le=5000),
+    ) -> dict[str, Any]:
+        event_list = trace_store.read_events(
+            session_id=session_id,
+            episode_id=episode_id,
+            after=after,
+            limit=limit,
+        )
+        return {"events": [event.model_dump(mode="json") for event in event_list]}
+
+    @app.get("/api/examples")
+    def examples() -> dict[str, Any]:
+        return {"examples": list_examples()}
+
+    @app.get("/api/examples/{example_id}")
+    def example(example_id: str, max_chars: int = Query(default=40_000, ge=1000, le=200_000)) -> dict[str, Any]:
+        try:
+            return preview_source(example_id, max_chars=max_chars)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/runs")
+    def start_run(request: RunRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+        try:
+            example_spec = get_example(request.example_id)
+            config = request.config.bounded_for(example_spec)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not example_spec.enabled:
+            raise HTTPException(status_code=400, detail=example_spec.disabled_reason or "example disabled")
+        if app.state.active_run_id is not None:
+            raise HTTPException(status_code=409, detail="a run is already active")
+        run_id = create_run_id(request.example_id)
+        payload = {
+            "run_id": run_id,
+            "example_id": request.example_id,
+            "family": example_spec.kernel_family,
+            "mode": request.mode,
+            "config": config.model_dump(mode="json"),
+        }
+        app.state.runs[run_id] = {"status": "queued", **payload}
+        app.state.active_run_id = run_id
+        trace_store.emit("run.requested", payload=payload)
+        background_tasks.add_task(_run_example_task, app, request.model_copy(update={"config": config}), run_id)
+        return {"run_id": run_id, "status": "queued"}
+
+    @app.get("/api/runs/{run_id}")
+    def run_status(run_id: str) -> dict[str, Any]:
+        run = app.state.runs.get(run_id)
+        if run is None:
+            events_for_run = _events_for_loop(trace_store.read_events(), run_id)
+            if not events_for_run:
+                raise HTTPException(status_code=404, detail="run not found")
+            return _loop_state(run_id, events_for_run)
+        return {**run, "events": [event.model_dump(mode="json") for event in _events_for_loop(trace_store.read_events(), run_id)]}
+
+    @app.get("/api/loops")
+    def loops(limit: int = Query(default=200, ge=0, le=2000)) -> dict[str, Any]:
+        events_for_loops = trace_store.read_events(limit=limit)
+        return {"loops": _summarize_loops(events_for_loops)}
+
+    @app.get("/api/loops/{loop_id}")
+    def loop(loop_id: str) -> dict[str, Any]:
+        events_for_loop = _events_for_loop(trace_store.read_events(), loop_id)
+        if not events_for_loop:
+            raise HTTPException(status_code=404, detail="loop not found")
+        return _loop_state(loop_id, events_for_loop)
+
+    @app.get("/api/benchmarks")
+    def benchmarks(limit: int = Query(default=500, ge=0, le=5000)) -> dict[str, Any]:
+        events_for_benchmarks = trace_store.read_events(limit=limit)
+        return {"benchmarks": _benchmark_rows(root, events_for_benchmarks)}
+
+    @app.get("/api/benchmarks/{run_id}/series")
+    def benchmark_series(run_id: str) -> dict[str, Any]:
+        events_for_run = _events_for_loop(trace_store.read_events(), run_id)
+        if not events_for_run:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {"run_id": run_id, "series": _series_for_run(root, events_for_run)}
+
+    @app.get("/api/comparisons")
+    def comparisons(limit: int = Query(default=500, ge=0, le=5000)) -> dict[str, Any]:
+        return {"comparisons": _comparison_rows(trace_store.read_events(limit=limit))}
+
+    @app.get("/api/episodes/{episode_id}")
+    def episode(episode_id: str) -> dict[str, Any]:
+        try:
+            loaded = EpisodeStore(workspace).load(episode_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return loaded.model_dump(mode="json", exclude_none=True)
+
+    @app.get("/api/artifacts/{artifact_path:path}/preview")
+    def artifact_preview_suffix(
+        artifact_path: str,
+        max_chars: int = Query(default=40_000, ge=100, le=200_000),
+    ) -> dict[str, Any]:
+        return _artifact_preview(root, artifact_path, max_chars=max_chars)
+
+    @app.get("/api/artifacts/preview/{artifact_path:path}")
+    def artifact_preview_prefix(
+        artifact_path: str,
+        max_chars: int = Query(default=40_000, ge=100, le=200_000),
+    ) -> dict[str, Any]:
+        return _artifact_preview(root, artifact_path, max_chars=max_chars)
+
+    @app.get("/api/artifacts/{artifact_path:path}")
+    def artifact(artifact_path: str) -> FileResponse:
+        path = _safe_artifact_path(root, artifact_path)
+        if not path.exists() or not path.is_file():
+            raise HTTPException(status_code=404, detail="artifact not found")
+        return FileResponse(path)
+
+    @app.get("/api/telemetry/gpu")
+    def gpu_telemetry() -> dict[str, Any]:
+        return {"gpus": read_gpu_telemetry()}
+
+    @app.get("/api/logs")
+    def logs(limit: int = Query(default=200, ge=0, le=1000)) -> dict[str, Any]:
+        return {"lines": trace_store.tail_logs(limit=limit)}
+
+    @app.get("/stream")
+    async def stream(after: str | None = None) -> StreamingResponse:
+        return StreamingResponse(
+            _event_stream(trace_store, after=after),
+            media_type="text/event-stream",
+        )
+
+    return app
+
+
+def read_gpu_telemetry() -> list[dict[str, Any]]:
+    query = ",".join(
+        (
+            "index",
+            "name",
+            "utilization.gpu",
+            "memory.used",
+            "memory.total",
+            "temperature.gpu",
+            "power.draw",
+        )
+    )
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--query-gpu={query}",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    gpus: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 7:
+            continue
+        gpus.append(
+            {
+                "index": _to_int(parts[0]),
+                "name": parts[1],
+                "utilization_gpu_pct": _to_float(parts[2]),
+                "memory_used_mib": _to_float(parts[3]),
+                "memory_total_mib": _to_float(parts[4]),
+                "temperature_c": _to_float(parts[5]),
+                "power_w": _to_float(parts[6]),
+            }
+        )
+    return gpus
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Serve the Compilagent observation dashboard.")
+    parser.add_argument("--workspace-root", type=Path, default=Path(".compilagent-triton"))
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+    import uvicorn
+
+    uvicorn.run(
+        create_app(workspace_root=args.workspace_root),
+        host=args.host,
+        port=args.port,
+    )
+
+
+async def _event_stream(trace_store: TraceStore, *, after: str | None = None) -> AsyncIterator[str]:
+    last_event_id = after
+    while True:
+        events = trace_store.read_events(after=last_event_id, limit=500)
+        for event in events:
+            last_event_id = event.event_id
+            yield f"id: {event.event_id}\nevent: {event.kind}\ndata: {event.model_dump_json()}\n\n"
+        await asyncio.sleep(1.0)
+
+
+def _run_example_task(app: FastAPI, request: RunRequest, run_id: str) -> None:
+    trace_store: TraceStore = app.state.trace_store
+    root: Path = app.state.workspace_root
+    try:
+        app.state.runs[run_id] = {**app.state.runs.get(run_id, {}), "status": "running"}
+        run_registered_example(
+            request=request,
+            run_id=run_id,
+            workspace_root=root,
+            trace_store=trace_store,
+        )
+        app.state.runs[run_id] = {**app.state.runs.get(run_id, {}), "status": "completed"}
+    except Exception as exc:
+        app.state.runs[run_id] = {
+            **app.state.runs.get(run_id, {}),
+            "status": "failed",
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
+    finally:
+        if app.state.active_run_id == run_id:
+            app.state.active_run_id = None
+
+
+def _summarize_loops(events: list[ObservationEvent]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[ObservationEvent]] = {}
+    for event in events:
+        loop_id = _event_loop_id(event)
+        if loop_id is None:
+            continue
+        grouped.setdefault(loop_id, []).append(event)
+    return [_loop_summary(loop_id, loop_events) for loop_id, loop_events in grouped.items()]
+
+
+def _loop_state(loop_id: str, events: list[ObservationEvent]) -> dict[str, Any]:
+    return {
+        **_loop_summary(loop_id, events),
+        "events": [event.model_dump(mode="json") for event in events],
+        "benchmarks": _benchmark_rows(None, events),
+        "comparisons": _comparison_rows(events),
+    }
+
+
+def _loop_summary(loop_id: str, events: list[ObservationEvent]) -> dict[str, Any]:
+    latest = events[-1]
+    status = _loop_status(events)
+    benchmark = next((event for event in reversed(events) if event.kind == "benchmark.completed"), None)
+    best = benchmark.payload.get("best", {}) if benchmark is not None else {}
+    return {
+        "id": loop_id,
+        "status": status,
+        "event_count": len(events),
+        "started_at": events[0].timestamp.isoformat(),
+        "updated_at": latest.timestamp.isoformat(),
+        "family": _first_payload_value(events, "family"),
+        "example_id": _first_payload_value(events, "example_id"),
+        "best_candidate_id": best.get("candidate_id"),
+        "best_median_ms": best.get("median_ms"),
+        "speedup_vs_baseline": best.get("speedup_vs_baseline"),
+    }
+
+
+def _loop_status(events: list[ObservationEvent]) -> str:
+    kinds = [event.kind for event in events]
+    if "run.failed" in kinds or "tool.failed" in kinds:
+        return "failed"
+    if "run.completed" in kinds or "loop.summary" in kinds:
+        return "completed"
+    if "run.started" in kinds or "benchmark.started" in kinds:
+        return "running"
+    if "run.requested" in kinds:
+        return "queued"
+    return "observed"
+
+
+def _event_loop_id(event: ObservationEvent) -> str | None:
+    payload = event.payload or {}
+    for key in ("run_id", "loop_id", "episode_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return event.episode_id or event.session_id
+
+
+def _events_for_loop(events: list[ObservationEvent], loop_id: str) -> list[ObservationEvent]:
+    return [event for event in events if _event_loop_id(event) == loop_id or event.episode_id == loop_id]
+
+
+def _first_payload_value(events: list[ObservationEvent], key: str) -> Any:
+    for event in events:
+        if key in event.payload:
+            return event.payload[key]
+    return None
+
+
+def _benchmark_rows(root: Path | None, events: list[ObservationEvent]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for event in events:
+        if event.kind != "benchmark.completed":
+            continue
+        payload = event.payload
+        run_id = payload.get("run_id") or event.event_id
+        family = payload.get("family")
+        result_rows = payload.get("results")
+        if not isinstance(result_rows, list) and root is not None:
+            result_rows = _load_result_rows_from_artifacts(root, event.artifact_paths)
+        if isinstance(result_rows, list):
+            for result in result_rows:
+                if isinstance(result, dict):
+                    rows.append({"run_id": run_id, "family": family, **result})
+            continue
+        best = payload.get("best")
+        if isinstance(best, dict):
+            rows.append({"run_id": run_id, "family": family, **best})
+    return rows
+
+
+def _series_for_run(root: Path, events: list[ObservationEvent]) -> list[dict[str, Any]]:
+    return sorted(
+        _benchmark_rows(root, events),
+        key=lambda row: (
+            row.get("median_ms") if isinstance(row.get("median_ms"), int | float) else float("inf"),
+            str(row.get("candidate_id", "")),
+        ),
+    )
+
+
+def _comparison_rows(events: list[ObservationEvent]) -> list[dict[str, Any]]:
+    rows = [
+        {"event_id": event.event_id, "timestamp": event.timestamp.isoformat(), **event.payload}
+        for event in events
+        if event.kind == "comparison.created"
+    ]
+    if rows:
+        return rows
+    for event in events:
+        if event.kind != "benchmark.completed":
+            continue
+        best = event.payload.get("best")
+        if not isinstance(best, dict):
+            continue
+        speedup = best.get("speedup_vs_baseline")
+        rows.append(
+            {
+                "event_id": event.event_id,
+                "timestamp": event.timestamp.isoformat(),
+                "run_id": event.payload.get("run_id"),
+                "family": event.payload.get("family"),
+                "candidate_id": best.get("candidate_id"),
+                "speedup_vs_baseline": speedup,
+                "delta_percent": (speedup - 1) * 100 if isinstance(speedup, int | float) else None,
+                "conclusion": _comparison_conclusion(speedup),
+            }
+        )
+    return rows
+
+
+def _comparison_conclusion(speedup: Any) -> str:
+    if not isinstance(speedup, int | float):
+        return "no baseline"
+    if speedup > 1.02:
+        return "candidate improved baseline"
+    if speedup < 0.98:
+        return "candidate regressed baseline"
+    return "within noise band"
+
+
+def _load_result_rows_from_artifacts(root: Path, artifact_paths: list[str]) -> list[dict[str, Any]] | None:
+    for artifact_path in artifact_paths:
+        if not artifact_path.endswith(".json"):
+            continue
+        path = _safe_artifact_path(root, artifact_path)
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    return None
+
+
+def _artifact_preview(root: Path, artifact_path: str, *, max_chars: int) -> dict[str, Any]:
+    path = _safe_artifact_path(root, artifact_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    truncated = len(raw) > max_chars
+    text = raw[:max_chars] if truncated else raw
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        render_mode = "json"
+        try:
+            parsed = json.loads(text)
+            text = json.dumps(parsed, indent=2)
+        except json.JSONDecodeError:
+            render_mode = "text"
+    elif suffix in {".md", ".markdown"}:
+        render_mode = "markdown"
+    elif suffix in {".ttir", ".ttgir", ".mlir", ".llir", ".ptx"}:
+        render_mode = "ir"
+    elif suffix in {".py", ".txt", ".log"}:
+        render_mode = "text"
+    else:
+        render_mode = "text"
+    return {
+        "path": str(path),
+        "relative_path": str(path.relative_to(root)),
+        "name": path.name,
+        "size_bytes": path.stat().st_size,
+        "render_mode": render_mode,
+        "language": _language_for_suffix(suffix),
+        "text": text,
+        "truncated": truncated,
+    }
+
+
+def _language_for_suffix(suffix: str) -> str:
+    return {
+        ".json": "json",
+        ".md": "markdown",
+        ".markdown": "markdown",
+        ".py": "python",
+        ".ttir": "mlir",
+        ".ttgir": "mlir",
+        ".mlir": "mlir",
+        ".llir": "llvm",
+        ".ptx": "ptx",
+    }.get(suffix, "text")
+
+
+def _safe_artifact_path(root: Path, artifact_path: str) -> Path:
+    path = (root / artifact_path).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="artifact path escapes workspace") from exc
+    return path
+
+
+def _to_int(value: str) -> int | None:
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _to_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def redacted_json_response(data: dict[str, Any]) -> JSONResponse:
+    return JSONResponse(redact(data))

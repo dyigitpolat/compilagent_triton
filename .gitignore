@@ -157,6 +157,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Compilagent experiment artifacts
+.compilagent-triton/
+
 # Spyder project settings
 .spyderproject
 .spyproject

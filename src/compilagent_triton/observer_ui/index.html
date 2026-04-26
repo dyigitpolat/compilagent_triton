@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Compilagent Triton Observer</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Compilagent Triton</p>
+          <h1>Optimization Cockpit</h1>
+          <p class="subtle">Choose an example, launch a controlled run, and watch the agentic compiler loop unfold.</p>
+        </div>
+        <div class="status-card">
+          <span class="pulse"></span>
+          <div>
+            <strong id="connection-status">Connecting</strong>
+            <small id="event-count">0 events</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="cockpit">
+        <aside class="rail">
+          <article class="card control-card">
+            <div class="card-title">
+              <h2>Harness Control</h2>
+              <button id="refresh-button" class="ghost-button">Refresh</button>
+            </div>
+            <label>
+              Example
+              <select id="example-select"></select>
+            </label>
+            <p id="example-description" class="subtle">Loading examples...</p>
+            <div class="control-grid">
+              <label>Repetitions <input id="repetitions-input" type="number" min="1" max="200" /></label>
+              <label>Warmup <input id="warmup-input" type="number" min="0" max="50" /></label>
+              <label>Block sizes <input id="block-sizes-input" type="text" placeholder="256,512,1024" /></label>
+              <label>Warps <input id="num-warps-input" type="text" placeholder="4,8" /></label>
+              <label>Cache modifiers <input id="cache-modifiers-input" type="text" placeholder="none,.ca,.cg" /></label>
+              <label>GPU index <input id="gpu-index-input" type="number" min="0" placeholder="auto" /></label>
+            </div>
+            <button id="run-button" class="run-button">Run Selected Example</button>
+            <div id="run-status" class="run-status">Ready.</div>
+          </article>
+
+          <article class="card">
+            <h2>Loops</h2>
+            <div id="loop-list" class="stack muted">No loops yet.</div>
+          </article>
+
+          <article class="card">
+            <h2>GPU Telemetry</h2>
+            <div id="gpu-list" class="stack muted">Waiting for telemetry...</div>
+            <div id="gpu-sparkline" class="sparkline"></div>
+          </article>
+        </aside>
+
+        <section class="main-stage">
+          <article class="card metrics-card">
+            <div>
+              <h2>Latest Benchmark</h2>
+              <div id="benchmark-summary" class="metric-grid muted">No benchmark events yet.</div>
+            </div>
+            <div>
+              <h2>Run Progress</h2>
+              <div id="run-progress" class="progress-panel muted">No active run.</div>
+            </div>
+          </article>
+
+          <article class="card stream-card">
+            <div class="card-title">
+              <h2>Live Agent Stream</h2>
+              <span id="selected-loop-label" class="pill">all loops</span>
+            </div>
+            <div id="timeline" class="timeline"></div>
+          </article>
+
+          <article class="card">
+            <h2>Benchmark Studio</h2>
+            <div class="chart-grid">
+              <div>
+                <h3>Candidate Ranking</h3>
+                <div id="ranking-chart" class="chart muted">No data yet.</div>
+              </div>
+              <div>
+                <h3>p20 / Median / p80</h3>
+                <div id="interval-chart" class="chart muted">No data yet.</div>
+              </div>
+              <div>
+                <h3>Throughput</h3>
+                <div id="throughput-chart" class="chart muted">No data yet.</div>
+              </div>
+              <div>
+                <h3>Before / After</h3>
+                <div id="comparison-board" class="chart muted">No comparison yet.</div>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <aside class="inspector">
+          <article class="card code-card">
+            <div class="card-title">
+              <h2>Source Preview</h2>
+              <span id="source-meta" class="pill">python</span>
+            </div>
+            <pre id="source-preview" class="code-block">Select an example to preview source.</pre>
+          </article>
+
+          <article class="card">
+            <h2>Current Evidence</h2>
+            <div id="experiment-board" class="stack muted">Hypotheses and candidates will appear here.</div>
+          </article>
+
+          <article class="card">
+            <h2>Artifacts</h2>
+            <div id="artifact-list" class="stack muted">No artifacts yet.</div>
+            <div id="artifact-preview" class="artifact-preview muted">Select an artifact to preview it.</div>
+          </article>
+
+          <article class="card">
+            <h2>Logs</h2>
+            <pre id="logs" class="logs">No logs yet.</pre>
+          </article>
+        </aside>
+      </section>
+
+      <section class="session-strip">
+        <div id="session-summary" class="subtle">Loading sessions...</div>
+      </section>
+    </main>
+    <script src="/assets/app.js" type="module"></script>
+  </body>
+</html>
