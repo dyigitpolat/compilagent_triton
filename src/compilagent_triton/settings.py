@@ -6,8 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-DEFAULT_MODEL = "anthropic:claude-opus-4-7"
-DEFAULT_REASONING_EFFORT = "extra_high"
+DEFAULT_MODEL = "mistral:mistral-large-latest"
+DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_HARNESS = "pydantic_ai"
 HarnessName = Literal["pydantic_ai", "claude_agent_sdk"]
 
@@ -62,6 +62,8 @@ class CompilagentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     anthropic_api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    mistral_api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+    openai_api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
     model_name: str = DEFAULT_MODEL
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     max_tokens: int = 8192
@@ -118,8 +120,12 @@ class CompilagentSettings(BaseModel):
         dotenv = _parse_env_file(env_path)
 
         api_key = _env_value("ANTHROPIC_API_KEY", dotenv)
+        mistral_key = _env_value("MISTRAL_API_KEY", dotenv)
+        openai_key = _env_value("OPENAI_API_KEY", dotenv)
         data: dict[str, Any] = {
             "anthropic_api_key": SecretStr(api_key) if api_key else None,
+            "mistral_api_key": SecretStr(mistral_key) if mistral_key else None,
+            "openai_api_key": SecretStr(openai_key) if openai_key else None,
             "model_name": _env_value("COMPILAGENT_MODEL", dotenv, DEFAULT_MODEL),
             "reasoning_effort": _env_value(
                 "COMPILAGENT_REASONING_EFFORT", dotenv, DEFAULT_REASONING_EFFORT

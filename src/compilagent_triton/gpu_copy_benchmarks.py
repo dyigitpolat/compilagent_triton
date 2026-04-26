@@ -26,6 +26,30 @@ def copy_kernel(x_ptr, out_ptr, n: tl.constexpr, BLOCK_SIZE: tl.constexpr):
     tl.store(out_ptr + offsets, vals, mask=mask)
 
 
+def _compilagent_compile_copy(meta: dict) -> object:
+    """One-shot launch returning the Triton handle for the agent compile path."""
+
+    import torch
+
+    n = int(meta.get("n_elements", 1024 * 1024))
+    block_size = int(meta.get("BLOCK_SIZE", 1024))
+    num_warps = int(meta.get("num_warps", 4))
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available for copy compile.")
+    x = torch.randn(n, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+
+    def grid(meta):
+        return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+
+    handle = copy_kernel[grid](x, out, n, BLOCK_SIZE=block_size, num_warps=num_warps)
+    torch.cuda.synchronize()
+    return handle
+
+
+copy_kernel.compilagent_compile = _compilagent_compile_copy
+
+
 @dataclass(frozen=True, slots=True)
 class CopyResult:
     candidate_id: str

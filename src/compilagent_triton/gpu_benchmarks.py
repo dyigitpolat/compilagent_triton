@@ -11,6 +11,70 @@ from uuid import uuid4
 
 from .trace_store import TraceStore
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - GPU-only dependency
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+
+
+if triton is not None:
+    @triton.jit
+    def vector_add_kernel(
+        x_ptr,
+        y_ptr,
+        out_ptr,
+        n: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        LOAD_CACHE_MODIFIER: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        if LOAD_CACHE_MODIFIER == "":
+            x_vals = tl.load(x_ptr + offsets, mask=mask)
+            y_vals = tl.load(y_ptr + offsets, mask=mask)
+        else:
+            x_vals = tl.load(x_ptr + offsets, mask=mask, cache_modifier=LOAD_CACHE_MODIFIER)
+            y_vals = tl.load(y_ptr + offsets, mask=mask, cache_modifier=LOAD_CACHE_MODIFIER)
+        out_vals = x_vals + y_vals
+        tl.store(out_ptr + offsets, out_vals, mask=mask)
+
+    def _compilagent_compile_vector_add(meta: dict) -> object:
+        """Run a single vector_add launch and return the Triton kernel handle.
+
+        Used by `OptimizerRuntime.compile_baseline` / `run_candidate` so the
+        agent gets a real `.asm` dict (TTIR / TTGIR / LLIR / PTX) without
+        running a full sweep.
+        """
+
+        import torch
+
+        n = int(meta.get("n_elements", 1024 * 1024))
+        block_size = int(meta.get("BLOCK_SIZE", 1024))
+        num_warps = int(meta.get("num_warps", 4))
+        cache_mod = str(meta.get("LOAD_CACHE_MODIFIER", ""))
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available for vector_add compile.")
+        x = torch.randn(n, device="cuda", dtype=torch.float32)
+        y = torch.randn(n, device="cuda", dtype=torch.float32)
+        out = torch.empty_like(x)
+
+        def grid(meta):
+            return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+
+        handle = vector_add_kernel[grid](
+            x, y, out, n,
+            BLOCK_SIZE=block_size,
+            LOAD_CACHE_MODIFIER=cache_mod,
+            num_warps=num_warps,
+        )
+        torch.cuda.synchronize()
+        return handle
+
+    vector_add_kernel.compilagent_compile = _compilagent_compile_vector_add
+
 
 @dataclass(frozen=True, slots=True)
 class VectorAddCandidate:
@@ -52,30 +116,6 @@ def run_vector_add_sweep(
     device: str = "cuda",
 ) -> list[VectorAddResult]:
     import torch
-    import triton.language as tl
-
-    import triton
-
-    @triton.jit
-    def vector_add_kernel(
-        x_ptr,
-        y_ptr,
-        out_ptr,
-        n: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-        LOAD_CACHE_MODIFIER: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n
-        if LOAD_CACHE_MODIFIER == "":
-            x_vals = tl.load(x_ptr + offsets, mask=mask)
-            y_vals = tl.load(y_ptr + offsets, mask=mask)
-        else:
-            x_vals = tl.load(x_ptr + offsets, mask=mask, cache_modifier=LOAD_CACHE_MODIFIER)
-            y_vals = tl.load(y_ptr + offsets, mask=mask, cache_modifier=LOAD_CACHE_MODIFIER)
-        out_vals = x_vals + y_vals
-        tl.store(out_ptr + offsets, out_vals, mask=mask)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available for vector-add sweep.")

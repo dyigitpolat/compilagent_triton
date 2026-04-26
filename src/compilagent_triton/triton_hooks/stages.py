@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .pipeline import PassIntervention, PassResult, StagePipeline
+
 
 @dataclass(frozen=True, slots=True)
 class StageHookConfig:
     key_material: str
     artifact_dir: Path | None = None
-    wrap_ttgir: bool = True
+    stage_names: tuple[str, ...] = ("ttir", "ttgir", "llir")
     label: str = "compilagent-stage-hook"
+    replace_stages: tuple[str, ...] = ()
+    """Stages to fully replace with our pass-by-pass executor (`ttir`, `ttgir`)."""
+    interventions: tuple[PassIntervention, ...] = ()
+    """Per-pass overrides applied when a stage is replaced."""
 
     @property
     def key(self) -> str:
@@ -27,11 +34,13 @@ class StageHookConfig:
 @dataclass(slots=True)
 class StageHookRecord:
     stage_name: str
+    digest: str
     artifact_path: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 StageCallback = Callable[[str, Any, dict[str, Any]], None]
+PassEventCallback = Callable[[str, PassResult], None]
 
 
 def make_stage_inspection_hook(
@@ -39,8 +48,17 @@ def make_stage_inspection_hook(
     *,
     callback: StageCallback | None = None,
     records: list[StageHookRecord] | None = None,
+    pass_callback: PassEventCallback | None = None,
 ):
-    """Build a Triton-compatible `add_stages_inspection_hook` callable."""
+    """Build a Triton-compatible `add_stages_inspection_hook` callable.
+
+    Two modes:
+    - default (observe): wraps the original stage function with timing/digest.
+    - replace: when a stage name is in `config.replace_stages`, the upstream
+      lambda is substituted by a `StagePipeline` that runs the stage pass-by-
+      pass with optional `PassIntervention` overrides. Per-pass results stream
+      through `pass_callback` if provided.
+    """
 
     records = records if records is not None else []
 
@@ -55,29 +73,56 @@ def make_stage_inspection_hook(
             return config.key, config.digest
         if stages is None or self is None:
             return config.key, config.digest
-        if not config.wrap_ttgir or "ttgir" not in stages:
-            return config.key, config.digest
+        stage_names = tuple(stage for stage in config.stage_names if stage in stages)
 
-        original_ttgir = stages["ttgir"]
-
-        def make_ttgir_wrapper(src, metadata):
-            module = original_ttgir(src, metadata)
-            artifact_path = _write_stage_artifact(config, "ttgir", module)
-            record = StageHookRecord(
-                stage_name="ttgir",
-                artifact_path=artifact_path,
-                metadata={
-                    "language": str(language),
-                    "capability": capability,
-                    "options": _safe_options(options),
-                },
+        replace_set = {s for s in config.replace_stages if s in stages}
+        if replace_set:
+            num_warps = int(getattr(options, "num_warps", 4) or 4)
+            num_stages = int(getattr(options, "num_stages", 3) or 3)
+            num_ctas = int(getattr(options, "num_ctas", 1) or 1)
+            interventions = {iv.pass_name: iv for iv in config.interventions}
+            pipeline = StagePipeline(
+                capability=int(capability),
+                num_warps=num_warps,
+                num_stages=num_stages,
+                num_ctas=num_ctas,
+                interventions=interventions,
+                on_pass=pass_callback,
+                capture_ir=True,
+                dump_dir=(config.artifact_dir / "passes") if config.artifact_dir else None,
             )
-            records.append(record)
-            if callback is not None:
-                callback("ttgir", module, metadata)
-            return module
+            if "ttir" in replace_set:
+                stages["ttir"] = lambda mod, metadata: pipeline.make_ttir(mod, metadata)
+            if "ttgir" in replace_set:
+                stages["ttgir"] = lambda mod, metadata: pipeline.make_ttgir(mod, metadata)
 
-        stages["ttgir"] = make_ttgir_wrapper
+        for stage_name in stage_names:
+            if stage_name in replace_set:
+                continue  # already substituted with our executor
+            original_stage = stages[stage_name]
+
+            def make_stage_wrapper(src, metadata, *, _stage_name=stage_name, _original=original_stage):
+                started = time.perf_counter()
+                module = _original(src, metadata)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                artifact_path = _write_stage_artifact(config, _stage_name, module)
+                record = StageHookRecord(
+                    stage_name=_stage_name,
+                    digest=config.digest,
+                    artifact_path=artifact_path,
+                    metadata={
+                        "duration_ms": elapsed_ms,
+                        "language": str(language),
+                        "capability": capability,
+                        "options": _safe_options(options),
+                    },
+                )
+                records.append(record)
+                if callback is not None:
+                    callback(_stage_name, module, metadata)
+                return module
+
+            stages[stage_name] = make_stage_wrapper
         return config.key, config.digest
 
     return inspect_stages_hook
@@ -89,6 +134,7 @@ def scoped_stage_hook(
     *,
     callback: StageCallback | None = None,
     records: list[StageHookRecord] | None = None,
+    pass_callback: PassEventCallback | None = None,
 ) -> Iterator[list[StageHookRecord]]:
     """Install a Triton stage hook for one experiment and restore previous state."""
 
@@ -103,6 +149,7 @@ def scoped_stage_hook(
         config,
         callback=callback,
         records=record_list,
+        pass_callback=pass_callback,
     )
     try:
         yield record_list

@@ -21,9 +21,11 @@ READ_ONLY_TOOL_NAMES = (
     "compile_baseline",
     "inspect_ir",
     "summarize_decisions",
+    "inspect_optimization_toolset",
     "propose_candidates",
     "validate_candidate",
     "compare_runs",
+    "compare_benchmarks",
 )
 ALL_TOOL_NAMES = (
     "describe_optimizer_surface",
@@ -34,10 +36,16 @@ ALL_TOOL_NAMES = (
     "inspect_ir",
     "summarize_decisions",
     "record_hypothesis",
+    "record_reasoning_summary",
+    "inspect_optimization_toolset",
     "propose_candidates",
+    "propose_candidate_from_toolset",
     "validate_candidate",
     "run_candidate",
+    "run_baseline_benchmark",
+    "run_candidate_benchmark",
     "compare_runs",
+    "compare_benchmarks",
     "accept_or_reject_candidate",
     "write_report",
 )
@@ -325,6 +333,33 @@ def create_optimizer_mcp_server(runtime: OptimizerRuntime) -> Any:
         read_only=False,
     )
     add_tool(
+        "record_reasoning_summary",
+        OptimizerRuntime.record_reasoning_summary.__doc__ or "",
+        {
+            "type": "object",
+            "properties": {
+                "episode_id": {"type": "string"},
+                "summary": {"type": "string"},
+                "linked_hypothesis_id": {"type": "string"},
+                "linked_candidate_id": {"type": "string"},
+                "evidence_refs_json": {"type": "string", "default": "[]"},
+                "next_step": {"type": "string"},
+            },
+            "required": ["episode_id", "summary"],
+        },
+        read_only=False,
+    )
+    add_tool(
+        "inspect_optimization_toolset",
+        OptimizerRuntime.inspect_optimization_toolset.__doc__ or "",
+        {
+            "type": "object",
+            "properties": {"kernel_id": {"type": "string"}},
+            "required": ["kernel_id"],
+        },
+        read_only=True,
+    )
+    add_tool(
         "propose_candidates",
         OptimizerRuntime.propose_candidates.__doc__ or "",
         {
@@ -338,6 +373,23 @@ def create_optimizer_mcp_server(runtime: OptimizerRuntime) -> Any:
             "required": ["kernel_id", "objective"],
         },
         read_only=True,
+    )
+    add_tool(
+        "propose_candidate_from_toolset",
+        OptimizerRuntime.propose_candidate_from_toolset.__doc__ or "",
+        {
+            "type": "object",
+            "properties": {
+                "kernel_id": {"type": "string"},
+                "kind": {"type": "string"},
+                "changes_json": {"type": "string"},
+                "description": {"type": "string"},
+                "expected_effect": {"type": "string"},
+                "hypothesis_id": {"type": "string"},
+            },
+            "required": ["kernel_id", "kind", "changes_json", "description", "expected_effect"],
+        },
+        read_only=False,
     )
     add_tool(
         "validate_candidate",
@@ -363,6 +415,34 @@ def create_optimizer_mcp_server(runtime: OptimizerRuntime) -> Any:
         read_only=False,
     )
     add_tool(
+        "run_baseline_benchmark",
+        OptimizerRuntime.run_baseline_benchmark.__doc__ or "",
+        {
+            "type": "object",
+            "properties": {
+                "episode_id": {"type": "string"},
+                "kernel_id": {"type": "string"},
+                "workload_json": {"type": "string", "default": "{}"},
+            },
+            "required": ["episode_id", "kernel_id"],
+        },
+        read_only=False,
+    )
+    add_tool(
+        "run_candidate_benchmark",
+        OptimizerRuntime.run_candidate_benchmark.__doc__ or "",
+        {
+            "type": "object",
+            "properties": {
+                "episode_id": {"type": "string"},
+                "candidate_json": {"type": "string"},
+                "workload_json": {"type": "string", "default": "{}"},
+            },
+            "required": ["episode_id", "candidate_json"],
+        },
+        read_only=False,
+    )
+    add_tool(
         "compare_runs",
         OptimizerRuntime.compare_runs.__doc__ or "",
         {
@@ -376,6 +456,20 @@ def create_optimizer_mcp_server(runtime: OptimizerRuntime) -> Any:
         read_only=True,
     )
     add_tool(
+        "compare_benchmarks",
+        OptimizerRuntime.compare_benchmarks.__doc__ or "",
+        {
+            "type": "object",
+            "properties": {
+                "episode_id": {"type": "string"},
+                "baseline_id": {"type": "string"},
+                "candidate_ids_json": {"type": "string"},
+            },
+            "required": ["episode_id", "baseline_id", "candidate_ids_json"],
+        },
+        read_only=True,
+    )
+    add_tool(
         "accept_or_reject_candidate",
         OptimizerRuntime.accept_or_reject_candidate.__doc__ or "",
         {
@@ -385,6 +479,8 @@ def create_optimizer_mcp_server(runtime: OptimizerRuntime) -> Any:
                 "candidate_id": {"type": "string"},
                 "status": {"type": "string"},
                 "rationale": {"type": "string"},
+                "evidence_ids_json": {"type": "string", "default": "[]"},
+                "compile_only": {"type": "boolean", "default": False},
             },
             "required": ["episode_id", "candidate_id", "status", "rationale"],
         },

@@ -3,15 +3,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .agent_runner import run_agent_optimization
 from .episodes import EpisodeStore
 from .events import ObservationEvent, redact
 from .examples import (
@@ -19,9 +21,11 @@ from .examples import (
     create_run_id,
     get_example,
     list_examples,
+    preview_kernel_source,
     preview_source,
     run_registered_example,
 )
+from .settings import CompilagentSettings
 from .trace_store import TraceStore
 from .workspace import OptimizationWorkspace
 
@@ -39,6 +43,7 @@ def create_app(*, workspace_root: Path | None = None) -> FastAPI:
     app.state.workspace = workspace
     app.state.runs = {}
     app.state.active_run_id = None
+    app.state.runtime_config = _runtime_config(root.parent)
 
     if UI_DIR.exists():
         app.mount("/assets", StaticFiles(directory=UI_DIR), name="assets")
@@ -82,6 +87,39 @@ def create_app(*, workspace_root: Path | None = None) -> FastAPI:
             return preview_source(example_id, max_chars=max_chars)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/examples/{example_id}/kernel")
+    def example_kernel(
+        example_id: str,
+        max_chars: int = Query(default=40_000, ge=1000, le=200_000),
+    ) -> dict[str, Any]:
+        try:
+            return preview_kernel_source(example_id, max_chars=max_chars)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/runtime/config")
+    def runtime_config() -> dict[str, Any]:
+        return dict(app.state.runtime_config)
+
+    @app.post("/api/runtime/config")
+    def update_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"harness", "mode", "model"}
+        updates = {key: value for key, value in config.items() if key in allowed}
+        if "harness" in updates and updates["harness"] not in {"pydantic_ai", "claude_agent_sdk"}:
+            raise HTTPException(status_code=400, detail="unsupported harness")
+        if "mode" in updates and updates["mode"] not in {"benchmark", "optimize"}:
+            raise HTTPException(status_code=400, detail="unsupported mode")
+        if "model" in updates:
+            new_model = str(updates["model"])
+            if ":" not in new_model:
+                raise HTTPException(
+                    status_code=400,
+                    detail="model must be `<provider>:<name>` (e.g. mistral:mistral-large-latest)",
+                )
+            os.environ["COMPILAGENT_MODEL"] = new_model
+        app.state.runtime_config = {**app.state.runtime_config, **updates}
+        return dict(app.state.runtime_config)
 
     @app.post("/api/runs")
     def start_run(request: RunRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
@@ -190,6 +228,36 @@ def create_app(*, workspace_root: Path | None = None) -> FastAPI:
             media_type="text/event-stream",
         )
 
+    @app.websocket("/ws")
+    async def ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+        last_id: str | None = websocket.query_params.get("after")
+        live_only = websocket.query_params.get("live") == "1"
+        if last_id is None and live_only:
+            # Skip historical events; start streaming from the next new one.
+            existing = trace_store.read_events(limit=1)
+            if existing:
+                # Iterate to the end to find the highest event id seen so far.
+                tail = trace_store.read_events(limit=0)
+                if tail:
+                    last_id = tail[-1].event_id
+        try:
+            while True:
+                events = trace_store.read_events(after=last_id, limit=1000)
+                if events:
+                    for event in events:
+                        last_id = event.event_id
+                        await websocket.send_text(event.model_dump_json())
+                    continue
+                await asyncio.sleep(0.15)
+        except WebSocketDisconnect:
+            return
+        except Exception:  # noqa: BLE001
+            try:
+                await websocket.close()
+            except Exception:  # noqa: BLE001
+                return
+
     return app
 
 
@@ -237,6 +305,29 @@ def read_gpu_telemetry() -> list[dict[str, Any]]:
     return gpus
 
 
+def _runtime_config(project_root: Path) -> dict[str, Any]:
+    settings = CompilagentSettings.from_env(project_root=project_root)
+    return {
+        "harness": settings.harness,
+        "mode": "benchmark",
+        "model": settings.model_name,
+        "reasoning_effort": settings.reasoning_effort,
+        "permission_mode": settings.claude_sdk_permission_mode,
+        "capabilities": [
+            {
+                "id": "pydantic_ai",
+                "label": "Current",
+                "summary": "ACP-native pydantic-ai harness with approval-gated optimizer tools.",
+            },
+            {
+                "id": "claude_agent_sdk",
+                "label": "Claude Agent SDK",
+                "summary": "Claude Agent SDK loop with in-process MCP access to optimizer tools.",
+            },
+        ],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve the Compilagent observation dashboard.")
     parser.add_argument("--workspace-root", type=Path, default=Path(".compilagent-triton"))
@@ -267,12 +358,20 @@ def _run_example_task(app: FastAPI, request: RunRequest, run_id: str) -> None:
     root: Path = app.state.workspace_root
     try:
         app.state.runs[run_id] = {**app.state.runs.get(run_id, {}), "status": "running"}
-        run_registered_example(
-            request=request,
-            run_id=run_id,
-            workspace_root=root,
-            trace_store=trace_store,
-        )
+        if request.mode == "optimize":
+            run_agent_optimization(
+                request=request,
+                run_id=run_id,
+                workspace_root=root,
+                trace_store=trace_store,
+            )
+        else:
+            run_registered_example(
+                request=request,
+                run_id=run_id,
+                workspace_root=root,
+                trace_store=trace_store,
+            )
         app.state.runs[run_id] = {**app.state.runs.get(run_id, {}), "status": "completed"}
     except Exception as exc:
         app.state.runs[run_id] = {

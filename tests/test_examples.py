@@ -7,6 +7,7 @@ from compilagent_triton.examples import (
     RunRequest,
     get_example,
     list_examples,
+    preview_kernel_source,
     preview_source,
 )
 
@@ -16,6 +17,7 @@ def test_example_registry_lists_runnable_sources() -> None:
 
     assert examples["vector_add"]["enabled"] is True
     assert examples["vector_copy"]["enabled"] is True
+    assert examples["reduction_sum"]["enabled"] is True
     assert examples["matmul_stub"]["enabled"] is False
     assert "block_sizes" in examples["vector_add"]["supported_knobs"]
 
@@ -25,6 +27,15 @@ def test_source_preview_returns_registered_source_only() -> None:
 
     assert preview["language"] == "python"
     assert "run_vector_add_sweep" in preview["source"]
+
+
+def test_kernel_preview_returns_jit_kernel_slice() -> None:
+    preview = preview_kernel_source("vector_add")
+
+    assert preview["source_kind"] == "kernel"
+    assert preview["symbol"] == "vector_add_kernel"
+    assert "@triton.jit" in preview["source"]
+    assert "run_vector_add_sweep" not in preview["source"]
 
 
 def test_run_config_bounds_candidate_count() -> None:

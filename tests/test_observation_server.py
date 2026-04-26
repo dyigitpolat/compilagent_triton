@@ -23,7 +23,7 @@ def test_observation_server_serves_dashboard_and_events(tmp_path) -> None:
     sessions = client.get("/api/sessions")
 
     assert index.status_code == 200
-    assert "Optimization Cockpit" in index.text
+    assert "Compilagent Triton Observer" in index.text
     assert events.json()["events"][0]["event_id"] == event.event_id
     assert sessions.json()["sessions"] == ["s1"]
 
@@ -45,11 +45,32 @@ def test_observation_server_serves_examples_and_source(tmp_path) -> None:
 
     examples = client.get("/api/examples")
     source = client.get("/api/examples/vector_add")
+    kernel = client.get("/api/examples/vector_add/kernel")
+    runtime = client.get("/api/runtime/config")
 
     assert examples.status_code == 200
     assert any(example["id"] == "vector_add" for example in examples.json()["examples"])
     assert source.status_code == 200
     assert "run_vector_add_sweep" in source.json()["source"]
+    assert kernel.status_code == 200
+    assert kernel.json()["source_kind"] == "kernel"
+    assert "vector_add_kernel" in kernel.json()["source"]
+    assert runtime.status_code == 200
+    assert runtime.json()["harness"] in {"pydantic_ai", "claude_agent_sdk"}
+
+
+def test_observation_server_updates_runtime_config(tmp_path) -> None:
+    workspace = tmp_path / ".compilagent-triton"
+    client = TestClient(create_app(workspace_root=workspace))
+
+    response = client.post(
+        "/api/runtime/config",
+        json={"harness": "claude_agent_sdk", "mode": "optimize", "ignored": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["harness"] == "claude_agent_sdk"
+    assert response.json()["mode"] == "optimize"
 
 
 def test_observation_server_aggregates_loops_benchmarks_and_previews(tmp_path) -> None:

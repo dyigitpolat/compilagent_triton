@@ -5,134 +5,138 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Compilagent Triton Observer</title>
     <link rel="stylesheet" href="/assets/styles.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css"
+    />
   </head>
   <body>
-    <main class="shell">
-      <section class="hero">
+    <header class="topbar" id="topbar">
+      <div class="topbar-brand">
+        <span class="brand-mark"></span>
         <div>
-          <p class="eyebrow">Compilagent Triton</p>
-          <h1>Optimization Cockpit</h1>
-          <p class="subtle">Choose an example, launch a controlled run, and watch the agentic compiler loop unfold.</p>
+          <strong>compilagent &middot; triton</strong>
+          <small id="topbar-subtitle">agentic compiler optimization</small>
         </div>
-        <div class="status-card">
-          <span class="pulse"></span>
-          <div>
-            <strong id="connection-status">Connecting</strong>
-            <small id="event-count">0 events</small>
+      </div>
+      <div class="topbar-controls">
+        <label class="ctl">
+          <span>Harness</span>
+          <select id="harness-select">
+            <option value="pydantic_ai">pydantic-ai</option>
+            <option value="claude_agent_sdk">Claude Agent SDK</option>
+          </select>
+        </label>
+        <label class="ctl ctl-wide">
+          <span>Model</span>
+          <select id="model-select">
+            <option value="mistral:mistral-large-latest">mistral · large-latest</option>
+            <option value="mistral:mistral-medium-latest">mistral · medium-latest</option>
+            <option value="mistral:mistral-small-latest">mistral · small-latest</option>
+            <option value="anthropic:claude-opus-4-7">anthropic · opus-4.7</option>
+            <option value="anthropic:claude-sonnet-4-6">anthropic · sonnet-4.6</option>
+            <option value="anthropic:claude-haiku-4-5">anthropic · haiku-4.5</option>
+            <option value="openai:gpt-5.1">openai · gpt-5.1</option>
+          </select>
+        </label>
+        <label class="ctl ctl-wide">
+          <span>Example</span>
+          <select id="example-select"></select>
+        </label>
+        <button id="run-button" class="btn btn-primary" type="button">
+          <span class="btn-label">Run</span>
+        </button>
+      </div>
+      <div class="topbar-status">
+        <span id="conn-pill" class="pill pill-muted">connecting…</span>
+        <span id="model-pill" class="pill pill-muted">model n/a</span>
+        <span id="effort-pill" class="pill pill-muted">effort n/a</span>
+      </div>
+    </header>
+
+    <div class="gpu-row" id="topbar-gpus"></div>
+
+    <div class="run-strip">
+      <div class="run-strip-meta">
+        <span id="run-status">Idle.</span>
+        <span id="run-id" class="muted"></span>
+      </div>
+      <div class="run-strip-progress">
+        <div id="run-progress-bar" class="progress-bar">
+          <div id="run-progress-fill" class="progress-fill"></div>
+        </div>
+        <span id="run-progress-pct" class="muted">0%</span>
+      </div>
+      <div class="run-strip-stats">
+        <span class="stat-mini"><small>speedup</small><strong id="metric-speedup">—</strong></span>
+        <span class="stat-mini"><small>median</small><strong id="metric-median">—</strong></span>
+        <span class="stat-mini"><small>candidates</small><strong id="metric-candidates">0</strong></span>
+        <span class="stat-mini"><small>passes</small><strong id="metric-passes">0</strong></span>
+      </div>
+      <details id="run-config-details" class="run-config">
+        <summary>Run config</summary>
+        <div class="run-config-grid">
+          <label><span>n_elements</span><input id="cfg-n-elements" type="number" min="1024" /></label>
+          <label><span>repetitions</span><input id="cfg-repetitions" type="number" min="1" /></label>
+          <label><span>warmup</span><input id="cfg-warmup" type="number" min="0" /></label>
+          <label><span>max seconds</span><input id="cfg-max-seconds" type="number" min="1" /></label>
+          <label><span>block sizes</span><input id="cfg-block-sizes" type="text" placeholder="256,512,1024" /></label>
+          <label><span>num_warps</span><input id="cfg-num-warps" type="text" placeholder="4,8" /></label>
+          <label><span>cache modifiers</span><input id="cfg-cache-modifiers" type="text" placeholder="none,.ca,.cg" /></label>
+          <label><span>gpu_index</span><input id="cfg-gpu-index" type="number" placeholder="auto" /></label>
+        </div>
+      </details>
+    </div>
+
+    <main class="workspace">
+      <section class="conversation" id="conversation">
+        <header class="conversation-header">
+          <div class="filter-row">
+            <strong>Conversation</strong>
+            <span class="muted" id="event-count">0 events</span>
+            <span class="filter-chips" id="filter-chips">
+              <button class="chip active" data-filter="all">all</button>
+              <button class="chip" data-filter="thinking">thinking</button>
+              <button class="chip" data-filter="text">assistant</button>
+              <button class="chip" data-filter="tool">tools</button>
+              <button class="chip" data-filter="candidate">candidates</button>
+              <button class="chip" data-filter="benchmark">benchmarks</button>
+              <button class="chip" data-filter="compiler">compiler</button>
+              <button class="chip" data-filter="reasoning">summaries</button>
+            </span>
+            <button id="clear-stream" class="btn btn-ghost" type="button">clear</button>
           </div>
+        </header>
+        <div class="stream-wrap">
+          <div id="stream" class="stream"></div>
+          <button id="more-updates" class="more-updates hidden" type="button">
+            <span>More updates</span><span aria-hidden="true">↓</span>
+          </button>
         </div>
-      </section>
-
-      <section class="cockpit">
-        <aside class="rail">
-          <article class="card control-card">
-            <div class="card-title">
-              <h2>Harness Control</h2>
-              <button id="refresh-button" class="ghost-button">Refresh</button>
-            </div>
-            <label>
-              Example
-              <select id="example-select"></select>
-            </label>
-            <p id="example-description" class="subtle">Loading examples...</p>
-            <div class="control-grid">
-              <label>Repetitions <input id="repetitions-input" type="number" min="1" max="200" /></label>
-              <label>Warmup <input id="warmup-input" type="number" min="0" max="50" /></label>
-              <label>Block sizes <input id="block-sizes-input" type="text" placeholder="256,512,1024" /></label>
-              <label>Warps <input id="num-warps-input" type="text" placeholder="4,8" /></label>
-              <label>Cache modifiers <input id="cache-modifiers-input" type="text" placeholder="none,.ca,.cg" /></label>
-              <label>GPU index <input id="gpu-index-input" type="number" min="0" placeholder="auto" /></label>
-            </div>
-            <button id="run-button" class="run-button">Run Selected Example</button>
-            <div id="run-status" class="run-status">Ready.</div>
-          </article>
-
-          <article class="card">
-            <h2>Loops</h2>
-            <div id="loop-list" class="stack muted">No loops yet.</div>
-          </article>
-
-          <article class="card">
-            <h2>GPU Telemetry</h2>
-            <div id="gpu-list" class="stack muted">Waiting for telemetry...</div>
-            <div id="gpu-sparkline" class="sparkline"></div>
-          </article>
-        </aside>
-
-        <section class="main-stage">
-          <article class="card metrics-card">
-            <div>
-              <h2>Latest Benchmark</h2>
-              <div id="benchmark-summary" class="metric-grid muted">No benchmark events yet.</div>
-            </div>
-            <div>
-              <h2>Run Progress</h2>
-              <div id="run-progress" class="progress-panel muted">No active run.</div>
-            </div>
-          </article>
-
-          <article class="card stream-card">
-            <div class="card-title">
-              <h2>Live Agent Stream</h2>
-              <span id="selected-loop-label" class="pill">all loops</span>
-            </div>
-            <div id="timeline" class="timeline"></div>
-          </article>
-
-          <article class="card">
-            <h2>Benchmark Studio</h2>
-            <div class="chart-grid">
-              <div>
-                <h3>Candidate Ranking</h3>
-                <div id="ranking-chart" class="chart muted">No data yet.</div>
-              </div>
-              <div>
-                <h3>p20 / Median / p80</h3>
-                <div id="interval-chart" class="chart muted">No data yet.</div>
-              </div>
-              <div>
-                <h3>Throughput</h3>
-                <div id="throughput-chart" class="chart muted">No data yet.</div>
-              </div>
-              <div>
-                <h3>Before / After</h3>
-                <div id="comparison-board" class="chart muted">No comparison yet.</div>
-              </div>
-            </div>
-          </article>
-        </section>
-
-        <aside class="inspector">
-          <article class="card code-card">
-            <div class="card-title">
-              <h2>Source Preview</h2>
-              <span id="source-meta" class="pill">python</span>
-            </div>
-            <pre id="source-preview" class="code-block">Select an example to preview source.</pre>
-          </article>
-
-          <article class="card">
-            <h2>Current Evidence</h2>
-            <div id="experiment-board" class="stack muted">Hypotheses and candidates will appear here.</div>
-          </article>
-
-          <article class="card">
-            <h2>Artifacts</h2>
-            <div id="artifact-list" class="stack muted">No artifacts yet.</div>
-            <div id="artifact-preview" class="artifact-preview muted">Select an artifact to preview it.</div>
-          </article>
-
-          <article class="card">
-            <h2>Logs</h2>
-            <pre id="logs" class="logs">No logs yet.</pre>
-          </article>
-        </aside>
-      </section>
-
-      <section class="session-strip">
-        <div id="session-summary" class="subtle">Loading sessions...</div>
       </section>
     </main>
-    <script src="/assets/app.js" type="module"></script>
+
+    <footer class="bottombar">
+      <span id="session-summary" class="muted">connecting…</span>
+      <span id="session-extra" class="muted"></span>
+    </footer>
+
+    <div id="artifact-preview" class="modal hidden">
+      <div class="modal-backdrop" data-modal-close></div>
+      <div class="modal-card">
+        <header>
+          <span class="pill pill-artifact" id="artifact-preview-stage">artifact</span>
+          <small id="artifact-preview-path" class="muted"></small>
+          <button class="btn btn-ghost" type="button" data-modal-close>close</button>
+        </header>
+        <pre><code id="artifact-preview-body"></code></pre>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/json.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <script src="/assets/app.js"></script>
   </body>
 </html>

@@ -37,6 +37,7 @@ class ExperimentMemory:
         self,
         *,
         kernel_family: str | None = None,
+        capability: int | None = None,
         min_speedup: float = 1.0,
     ) -> list[PriorResult]:
         results: list[PriorResult] = []
@@ -51,6 +52,10 @@ class ExperimentMemory:
                     continue
                 if kernel_family is not None and prior.kernel_family != kernel_family:
                     continue
+                if capability is not None:
+                    item_cap = item.get("compute_capability") if isinstance(item, dict) else None
+                    if isinstance(item_cap, int) and item_cap != capability:
+                        continue
                 if prior.score < min_speedup:
                     continue
                 results.append(prior)

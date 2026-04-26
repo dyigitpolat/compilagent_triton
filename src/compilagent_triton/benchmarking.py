@@ -17,6 +17,78 @@ class BenchmarkBudget:
     noise_threshold_pct: float = 2.0
 
 
+def time_with_cuda_events(fn: Callable[[], Any]) -> float:
+    """Time `fn()` end-to-end using CUDA events; returns ms.
+
+    Falls back to `time.perf_counter()` when CUDA is unavailable. Synchronizes
+    around the call to defeat asynchronous launch noise.
+    """
+
+    try:
+        import torch  # type: ignore[import-not-found]
+        if torch.cuda.is_available():
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start.record()
+            fn()
+            end.record()
+            end.synchronize()
+            return float(start.elapsed_time(end))
+    except Exception:
+        pass
+    t0 = time.perf_counter()
+    fn()
+    return (time.perf_counter() - t0) * 1000.0
+
+
+def device_peak_bandwidth_gbps() -> float | None:
+    """Estimate the active CUDA device's HBM peak bandwidth in GB/s.
+
+    Used as the denominator for the roofline model. Returns None on CPU.
+    """
+
+    try:
+        import torch  # type: ignore[import-not-found]
+        if not torch.cuda.is_available():
+            return None
+        props = torch.cuda.get_device_properties(0)
+        # memory_clock_rate is in kHz, memory_bus_width in bits
+        mc_khz = float(getattr(props, "memory_clock_rate", 0) or 0)
+        bus_bits = float(getattr(props, "memory_bus_width", 0) or 0)
+        if mc_khz <= 0 or bus_bits <= 0:
+            return None
+        # GDDR / HBM rates are double-data-rate; bandwidth = 2 * clock * bus / 8
+        # Output GB/s
+        return 2.0 * mc_khz * 1e3 * bus_bits / 8.0 / 1e9
+    except Exception:
+        return None
+
+
+def compute_profile_metrics(
+    *,
+    median_ms: float | None,
+    bytes_moved: int | None,
+    flops: int | None = None,
+) -> dict[str, Any]:
+    """Build a profile_metrics dict from a measured median + workload bytes."""
+
+    metrics: dict[str, Any] = {}
+    if median_ms is None or median_ms <= 0:
+        return metrics
+    seconds = median_ms / 1000.0
+    if bytes_moved is not None and bytes_moved > 0:
+        achieved_gbps = bytes_moved / 1e9 / seconds
+        metrics["achieved_bandwidth_gbps"] = achieved_gbps
+        peak = device_peak_bandwidth_gbps()
+        if peak and peak > 0:
+            metrics["roofline_bandwidth_ratio"] = achieved_gbps / peak
+            metrics["device_peak_bandwidth_gbps"] = peak
+    if flops is not None and flops > 0:
+        metrics["achieved_tflops"] = flops / 1e12 / seconds
+    return metrics
+
+
 def run_callable_benchmark(
     *,
     kernel_id: str,
@@ -45,9 +117,7 @@ def run_callable_benchmark(
         for _ in range(budget.repetitions):
             if time.perf_counter() - start_budget > budget.max_seconds:
                 break
-            start = time.perf_counter()
-            fn()
-            timings.append((time.perf_counter() - start) * 1000)
+            timings.append(time_with_cuda_events(fn))
         median_ms = statistics.median(timings) if timings else None
         return BenchmarkResult(
             kernel_id=kernel_id,

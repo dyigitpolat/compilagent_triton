@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import Callable
 from dataclasses import asdict
@@ -73,6 +74,7 @@ class ExampleSpec(BaseModel):
     kernel_family: str
     source_path: Path
     entrypoint: str
+    kernel_symbol: str | None = None
     supported_knobs: list[str]
     default_config: RunConfig
     enabled: bool = True
@@ -85,6 +87,7 @@ class ExampleSpec(BaseModel):
             "description": self.description,
             "kernel_family": self.kernel_family,
             "entrypoint": self.entrypoint,
+            "kernel_symbol": self.kernel_symbol,
             "supported_knobs": self.supported_knobs,
             "default_config": self.default_config.model_dump(mode="json"),
             "enabled": self.enabled,
@@ -123,7 +126,44 @@ def preview_source(example_id: str, *, max_chars: int = 40_000) -> dict[str, Any
         **example.public_metadata(),
         "language": "python",
         "source": text,
+        "source_kind": "harness",
         "line_count": text.count("\n") + (1 if text else 0),
+        "truncated": truncated,
+    }
+
+
+def preview_kernel_source(example_id: str, *, max_chars: int = 40_000) -> dict[str, Any]:
+    example = get_example(example_id)
+    if example.kernel_symbol is None:
+        return {
+            **example.public_metadata(),
+            "language": "python",
+            "source": "",
+            "source_kind": "missing",
+            "warning": (
+                f"Example `{example.id}` has no kernel_symbol; the observer refuses to "
+                "fall back to the full harness file. Set kernel_symbol on the ExampleSpec "
+                "to enable kernel-only preview."
+            ),
+            "symbol": None,
+        }
+    source_path = example.source_path.resolve()
+    if not source_path.is_file():
+        raise ValueError(f"source for example `{example_id}` is missing")
+    text = source_path.read_text(encoding="utf-8")
+    source, start_line, end_line = _extract_symbol_source(text, example.kernel_symbol)
+    truncated = len(source) > max_chars
+    if truncated:
+        source = source[:max_chars]
+    return {
+        **example.public_metadata(),
+        "language": "python",
+        "source": source,
+        "source_kind": "kernel",
+        "symbol": example.kernel_symbol,
+        "line_start": start_line,
+        "line_end": end_line,
+        "line_count": source.count("\n") + (1 if source else 0),
         "truncated": truncated,
     }
 
@@ -207,6 +247,7 @@ def _registry() -> dict[str, ExampleSpec]:
             kernel_family="vector_add",
             source_path=PACKAGE_DIR / "gpu_benchmarks.py",
             entrypoint="run_vector_add_sweep",
+            kernel_symbol="vector_add_kernel",
             supported_knobs=["block_sizes", "num_warps", "load_cache_modifiers"],
             default_config=RunConfig(
                 n_elements=8_388_608,
@@ -224,6 +265,7 @@ def _registry() -> dict[str, ExampleSpec]:
             kernel_family="vector_copy",
             source_path=PACKAGE_DIR / "gpu_copy_benchmarks.py",
             entrypoint="run_copy_sweep",
+            kernel_symbol="copy_kernel",
             supported_knobs=["block_sizes", "num_warps"],
             default_config=RunConfig(
                 n_elements=8_388_608,
@@ -233,6 +275,23 @@ def _registry() -> dict[str, ExampleSpec]:
                 warmup=20,
             ),
         ),
+        "reduction_sum": ExampleSpec(
+            id="reduction_sum",
+            title="Reduction Sum",
+            description="Block-level sum reduction focused on masks, vector width, and memory-layout evidence.",
+            kernel_family="reduction",
+            source_path=PACKAGE_DIR / "gpu_reduction_benchmarks.py",
+            entrypoint="run_reduction_sweep",
+            kernel_symbol="reduction_sum_kernel",
+            supported_knobs=["block_sizes", "num_warps"],
+            default_config=RunConfig(
+                n_elements=8_388_608,
+                block_sizes=[256, 512, 1024, 2048],
+                num_warps=[4, 8],
+                repetitions=50,
+                warmup=10,
+            ),
+        ),
         "matmul_stub": ExampleSpec(
             id="matmul_stub",
             title="Matmul",
@@ -240,6 +299,7 @@ def _registry() -> dict[str, ExampleSpec]:
             kernel_family="matmul",
             source_path=PACKAGE_DIR / "gpu_benchmarks.py",
             entrypoint="not_implemented",
+            kernel_symbol=None,
             supported_knobs=[],
             default_config=RunConfig(),
             enabled=False,
@@ -253,6 +313,8 @@ def _runner_for(example_id: str) -> Callable[[RunConfig, Path, str], dict[str, A
         return _run_vector_add
     if example_id == "vector_copy":
         return _run_vector_copy
+    if example_id == "reduction_sum":
+        return _run_reduction_sum
     raise ValueError(f"example `{example_id}` has no runner")
 
 
@@ -296,6 +358,27 @@ def _run_vector_copy(config: RunConfig, workspace_root: Path, run_id: str) -> di
         family="vector_copy",
         results=[asdict(result) for result in results],
         markdown=render_copy_report(results),
+    )
+
+
+def _run_reduction_sum(config: RunConfig, workspace_root: Path, run_id: str) -> dict[str, Any]:
+    from .gpu_reduction_benchmarks import render_reduction_report, run_reduction_sweep
+
+    results = run_reduction_sweep(
+        n_elements=config.n_elements,
+        block_sizes=tuple(config.block_sizes),
+        num_warps_values=tuple(config.num_warps),
+        repetitions=config.repetitions,
+        warmup=config.warmup,
+        device=config.device,
+    )
+    return _write_result_artifacts(
+        workspace_root=workspace_root,
+        run_id=run_id,
+        n_elements=config.n_elements,
+        family="reduction",
+        results=[asdict(result) for result in results],
+        markdown=render_reduction_report(results),
     )
 
 
@@ -345,3 +428,14 @@ def _comparison_payload(*, run_id: str, family: str, best: dict[str, Any]) -> di
         "delta_percent": (speedup - 1) * 100 if isinstance(speedup, int | float) else None,
         "conclusion": conclusion,
     }
+
+
+def _extract_symbol_source(source: str, symbol: str) -> tuple[str, int, int]:
+    tree = ast.parse(source)
+    lines = source.splitlines()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == symbol:
+            start = min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
+            end = node.end_lineno or node.lineno
+            return "\n".join(lines[start - 1 : end]), start, end
+    raise ValueError(f"symbol `{symbol}` was not found")

@@ -38,8 +38,12 @@ def validate_candidate(candidate: CandidateConfig) -> CandidateValidation:
         _validate_meta_candidate(candidate.changes, diagnostics)
     elif candidate.kind == CandidateKind.COALESCING_POLICY:
         _validate_coalescing_candidate(candidate.changes, diagnostics)
+    elif candidate.kind == CandidateKind.MEMORY_ACCESS_POLICY:
+        _validate_memory_access_candidate(candidate.changes, diagnostics)
     elif candidate.kind == CandidateKind.MATMUL_POLICY:
         _validate_matmul_candidate(candidate.changes, diagnostics)
+    elif candidate.kind == CandidateKind.PASS_INTERVENTIONS:
+        _validate_pass_interventions_candidate(candidate.changes, diagnostics)
     else:
         diagnostics.append(f"Unsupported candidate kind: {candidate.kind}")
 
@@ -73,7 +77,7 @@ def _validate_meta_candidate(changes: dict[str, Any], diagnostics: list[str]) ->
 
 
 def _validate_coalescing_candidate(changes: dict[str, Any], diagnostics: list[str]) -> None:
-    allowed = {"op_name", "order", "per_thread", "vector_width", "reason"}
+    allowed = {"op_name", "order", "per_thread", "vector_width", "reason"} | _VALID_META_KEYS
     unknown = sorted(set(changes) - allowed)
     if unknown:
         diagnostics.append(f"Unsupported coalescing keys: {', '.join(unknown)}")
@@ -86,8 +90,55 @@ def _validate_coalescing_candidate(changes: dict[str, Any], diagnostics: list[st
             diagnostics.append(f"`{key}` must be a positive integer.")
 
 
+def _validate_memory_access_candidate(changes: dict[str, Any], diagnostics: list[str]) -> None:
+    allowed = {
+        "LOAD_CACHE_MODIFIER", "eviction_policy", "vector_width",
+        "mask_strategy", "reason",
+    } | _VALID_META_KEYS
+    unknown = sorted(set(changes) - allowed)
+    if unknown:
+        diagnostics.append(f"Unsupported memory-access keys: {', '.join(unknown)}")
+    if "LOAD_CACHE_MODIFIER" in changes and changes["LOAD_CACHE_MODIFIER"] not in {"", ".ca", ".cg"}:
+        diagnostics.append("`LOAD_CACHE_MODIFIER` must be one of '', '.ca', or '.cg'.")
+    if "eviction_policy" in changes and changes["eviction_policy"] not in {"", "evict_last", "evict_first"}:
+        diagnostics.append("`eviction_policy` must be '', 'evict_last', or 'evict_first'.")
+    if "vector_width" in changes and (not isinstance(changes["vector_width"], int) or changes["vector_width"] <= 0):
+        diagnostics.append("`vector_width` must be a positive integer.")
+
+
+def _validate_pass_interventions_candidate(
+    changes: dict[str, Any], diagnostics: list[str]
+) -> None:
+    from .triton_hooks.passes import all_pass_names
+
+    allowed = {"pass_interventions", "reason"} | _VALID_META_KEYS
+    unknown = sorted(set(changes) - allowed)
+    if unknown:
+        diagnostics.append(f"Unsupported pass-intervention keys: {', '.join(unknown)}")
+    items = changes.get("pass_interventions") or []
+    if not isinstance(items, list) or not items:
+        diagnostics.append(
+            "`pass_interventions` must be a non-empty list of {pass_name, action[, args, rationale]} dicts."
+        )
+        return
+    valid_passes = set(all_pass_names())
+    valid_actions = {"run", "skip", "replace"}
+    for entry in items:
+        if not isinstance(entry, dict):
+            diagnostics.append("each pass_interventions entry must be a dict")
+            continue
+        pass_name = entry.get("pass_name")
+        if pass_name not in valid_passes:
+            diagnostics.append(f"unknown pass `{pass_name}`")
+        action = entry.get("action", "run")
+        if action not in valid_actions:
+            diagnostics.append(
+                f"action must be one of {sorted(valid_actions)}, got `{action}`"
+            )
+
+
 def _validate_matmul_candidate(changes: dict[str, Any], diagnostics: list[str]) -> None:
-    allowed = {"mma_version", "warps_per_tile", "reason"}
+    allowed = {"mma_version", "warps_per_tile", "reason"} | _VALID_META_KEYS
     unknown = sorted(set(changes) - allowed)
     if unknown:
         diagnostics.append(f"Unsupported matmul keys: {', '.join(unknown)}")

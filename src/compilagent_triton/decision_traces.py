@@ -10,6 +10,11 @@ _ENCODING_RE = re.compile(r"#(?:ttg|triton_gpu)\.[A-Za-z0-9_]+<([^>]*)>")
 _NUM_WARPS_RE = re.compile(r'"ttg\.num-warps"\s*=\s*(\d+)')
 _THREADS_PER_WARP_RE = re.compile(r'"ttg\.threads-per-warp"\s*=\s*(\d+)')
 _TENSOR_SHAPE_RE = re.compile(r"tensor<([0-9x]+)x")
+_MASK_RE = re.compile(r"\bmask\s*=")
+_VECTOR_WIDTH_RE = re.compile(r"vec(?:tor)?[_-]?width\s*=?\s*(\d+)|x(\d+)x")
+_MEMDESC_RE = re.compile(r"!ttg\.memdesc<([^>]*)>|memdesc<([^>]*)>")
+_SWIZZLE_RE = re.compile(r"swizzl\w+\s*=\s*([^,\s>]+)")
+_LOCAL_ALLOC_RE = re.compile(r"\bttg\.local_alloc\b")
 
 
 def extract_decision_traces(
@@ -41,7 +46,7 @@ def extract_decision_traces(
                     num_warps=num_warps,
                     threads_per_warp=threads_per_warp,
                     evidence=_truncate(line.strip(), max_evidence_chars),
-                    metadata={"encodings": _ENCODING_RE.findall(line)},
+                    metadata=_memory_metadata(line),
                 )
             )
         elif _DOT_RE.search(line):
@@ -55,7 +60,21 @@ def extract_decision_traces(
                     num_warps=num_warps,
                     threads_per_warp=threads_per_warp,
                     evidence=_truncate(line.strip(), max_evidence_chars),
-                    metadata={"encodings": _ENCODING_RE.findall(line)},
+                    metadata=_memory_metadata(line),
+                )
+            )
+        elif _LOCAL_ALLOC_RE.search(line):
+            traces.append(
+                DecisionTrace(
+                    run_id=run_id,
+                    kind=DecisionKind.COALESCING,
+                    op_name="ttg.local_alloc",
+                    op_location=f"line:{index}",
+                    tensor_shape=_shape_from_line(line),
+                    num_warps=num_warps,
+                    threads_per_warp=threads_per_warp,
+                    evidence=_truncate(line.strip(), max_evidence_chars),
+                    metadata=_memory_metadata(line) | {"local_alloc": True},
                 )
             )
     return traces
@@ -93,6 +112,22 @@ def _shape_from_line(line: str) -> tuple[int, ...] | None:
         return tuple(int(part) for part in match.group(1).split("x") if part)
     except ValueError:
         return None
+
+
+def _memory_metadata(line: str) -> dict[str, object]:
+    vector_match = _VECTOR_WIDTH_RE.search(line)
+    vector_width = None
+    if vector_match is not None:
+        raw = next((group for group in vector_match.groups() if group), None)
+        vector_width = int(raw) if raw is not None else None
+    memdesc = [item for match in _MEMDESC_RE.findall(line) for item in match if item]
+    return {
+        "encodings": _ENCODING_RE.findall(line),
+        "has_mask": bool(_MASK_RE.search(line)),
+        "memdesc": memdesc,
+        "swizzles": _SWIZZLE_RE.findall(line),
+        "vector_width": vector_width,
+    }
 
 
 def _truncate(text: str, limit: int) -> str:

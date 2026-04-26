@@ -13,6 +13,9 @@ class CandidateKind(StrEnum):
     META_PARAMETERS = "meta_parameters"
     COALESCING_POLICY = "coalescing_policy"
     MATMUL_POLICY = "matmul_policy"
+    MEMORY_ACCESS_POLICY = "memory_access_policy"
+    PASS_INTERVENTIONS = "pass_interventions"
+    """Direct overrides on Triton MLIR pass execution (skip / param-tweak)."""
 
 
 class CandidateStatus(StrEnum):
@@ -58,6 +61,7 @@ class CompileRequest(BaseModel):
     dump_ir: bool = True
     stage_hook_key: str | None = None
     candidate_id: str | None = None
+    diagnostic_env: dict[str, str] = Field(default_factory=dict)
 
 
 class CompileArtifact(BaseModel):
@@ -66,6 +70,7 @@ class CompileArtifact(BaseModel):
     stage: str
     path: Path | None = None
     inline_text: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class CompileResult(BaseModel):
@@ -129,17 +134,18 @@ class CandidateConfig(BaseModel):
     kernel_id: str
     kind: CandidateKind
     hypothesis_id: str | None = None
-    description: str
+    description: str = ""
     changes: dict[str, Any]
-    expected_effect: str
+    expected_effect: str = ""
     validation_constraints: list[str] = Field(default_factory=list)
     status: CandidateStatus = CandidateStatus.PROPOSED
 
     @field_validator("description", "expected_effect")
     @classmethod
     def _text_required(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("text must not be blank")
+        # Permit empty so legacy / policy-generated candidates round-trip; the
+        # validator emits a diagnostic upstream when these are not filled.
+        return value
         return value
 
 
@@ -153,10 +159,37 @@ class BenchmarkResult(BaseModel):
     compile_ok: bool
     timings_ms: list[float] = Field(default_factory=list)
     median_ms: float | None = None
+    p20_ms: float | None = None
+    p80_ms: float | None = None
+    sample_count: int = 0
     speedup_vs_baseline: float | None = None
+    speedup_confidence: Literal["high", "medium", "low", "none"] = "none"
+    noise_threshold_pct: float | None = None
     diagnostics: str | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
+    workload: dict[str, Any] = Field(default_factory=dict)
+    profile_metrics: dict[str, Any] = Field(default_factory=dict)
+    """GPU-side metrics (occupancy, achieved bandwidth, roofline ratio, ...)."""
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ReasoningSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(default_factory=lambda: f"reason-{uuid4().hex[:10]}")
+    summary: str
+    linked_hypothesis_id: str | None = None
+    linked_candidate_id: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    next_step: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("summary")
+    @classmethod
+    def _summary_required(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("summary must not be blank")
+        return value
 
 
 class OptimizationEpisode(BaseModel):
@@ -169,6 +202,7 @@ class OptimizationEpisode(BaseModel):
     model_metadata: dict[str, Any]
     baseline_run_id: str | None = None
     hypotheses: list[Hypothesis] = Field(default_factory=list)
+    reasoning_summaries: list[ReasoningSummary] = Field(default_factory=list)
     candidates: list[CandidateConfig] = Field(default_factory=list)
     benchmark_results: list[BenchmarkResult] = Field(default_factory=list)
     conclusions: list[str] = Field(default_factory=list)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from compilagent_triton.agent import agent_factory_from_session, build_config, b
 from compilagent_triton.claude_agent_harness import ClaudeAgentSdkHarness
 from compilagent_triton.harness_selection import CLAUDE_AGENT_SDK_HARNESS, HARNESS_CONFIG_ID
 from compilagent_triton.optimizer_runtime import OptimizerRuntime
+from compilagent_triton.schemas import CandidateConfig, CompileArtifact, CompileResult
 from compilagent_triton.settings import CompilagentSettings
 from compilagent_triton.workspace import OptimizationWorkspace
 
@@ -148,3 +150,94 @@ def test_claude_sdk_harness_uses_mocked_sdk_client(tmp_path: Path, monkeypatch: 
     assert "mcp__triton_optimizer__run_candidate" in sdk_harness._client.options.kwargs[
         "allowed_tools"
     ]
+
+
+def test_runtime_toolset_candidates_and_benchmark_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = OptimizationWorkspace(tmp_path).ensure()
+    runtime = OptimizerRuntime(
+        settings=CompilagentSettings(model_name="test"),
+        workspace=workspace,
+        harness_label="test",
+    )
+    kernel_path = tmp_path / "kernel.py"
+    kernel_path.write_text("def kernel(**meta):\n    return None\n", encoding="utf-8")
+    runtime.register_kernel("k", "kernel", str(kernel_path), "kernel")
+    episode = json.loads(runtime.start_episode("k", "beat baseline"))
+
+    def fake_compile(self, spec, request, **kwargs):
+        del self, spec, kwargs
+        return CompileResult(
+            kernel_id=request.kernel_id,
+            candidate_id=request.candidate_id,
+            ok=True,
+            artifacts=[CompileArtifact(stage="ttgir", inline_text="module { %0 = tt.load %ptr }")],
+        )
+
+    monkeypatch.setattr(type(runtime.harness), "compile_kernel", fake_compile)
+    toolset = json.loads(runtime.inspect_optimization_toolset("k"))
+    candidate = json.loads(
+        runtime.propose_candidate_from_toolset(
+            kernel_id="k",
+            kind="memory_access_policy",
+            changes_json='{"LOAD_CACHE_MODIFIER": ".cg", "reason": "streaming read"}',
+            description="Prefer cache-global load policy for streaming reads.",
+            expected_effect="Reduce cache pollution for one-pass memory traffic.",
+        )
+    )
+    baseline = json.loads(runtime.run_baseline_benchmark(episode["id"], "k", '{"median_ms": 2.0}'))
+    candidate_result = json.loads(
+        runtime.run_candidate_benchmark(
+            episode["id"],
+            json.dumps(candidate),
+            '{"median_ms": 1.0}',
+        )
+    )
+    comparison = json.loads(
+        runtime.compare_benchmarks(episode["id"], baseline["id"], json.dumps([candidate_result["id"]]))
+    )
+    accepted = json.loads(
+        runtime.accept_or_reject_candidate(
+            episode["id"],
+            candidate["id"],
+            "accepted",
+            "Candidate has measured speedup.",
+            evidence_ids_json=json.dumps([candidate_result["id"]]),
+        )
+    )
+
+    assert toolset["levers"]
+    assert candidate["kind"] == "memory_access_policy"
+    assert candidate_result["speedup_vs_baseline"] == 2.0
+    assert comparison["conclusion"] == "candidate improved baseline"
+    assert accepted["candidates"][0]["status"] == "accepted"
+
+
+def test_runtime_rejects_candidate_judgment_without_benchmark_evidence(tmp_path: Path) -> None:
+    workspace = OptimizationWorkspace(tmp_path).ensure()
+    runtime = OptimizerRuntime(
+        settings=CompilagentSettings(model_name="test"),
+        workspace=workspace,
+        harness_label="test",
+    )
+    kernel_path = tmp_path / "kernel.py"
+    kernel_path.write_text("def kernel(**meta):\n    return None\n", encoding="utf-8")
+    runtime.register_kernel("k", "kernel", str(kernel_path), "kernel")
+    episode = json.loads(runtime.start_episode("k", "beat baseline"))
+    candidate = json.loads(
+        runtime.propose_candidate_from_toolset(
+            kernel_id="k",
+            kind="memory_access_policy",
+            changes_json='{"LOAD_CACHE_MODIFIER": ".ca"}',
+            description="Use cache-all loads.",
+            expected_effect="Increase cache reuse.",
+        )
+    )
+    runtime.episode_store.add_candidate(episode["id"], CandidateConfig.model_validate(candidate))
+
+    with pytest.raises(ValueError, match="benchmark evidence"):
+        runtime.accept_or_reject_candidate(
+            episode["id"],
+            candidate["id"],
+            "accepted",
+            "No measurements yet.",
+        )

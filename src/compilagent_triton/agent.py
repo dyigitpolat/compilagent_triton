@@ -575,6 +575,52 @@ def build_optimizer_agent(
             evidence_refs_json=evidence_refs_json,
         )
 
+    @agent.tool_plain(name="record_reasoning_summary", requires_approval=True)
+    def record_reasoning_summary(
+        episode_id: str,
+        summary: str,
+        linked_hypothesis_id: str | None = None,
+        linked_candidate_id: str | None = None,
+        evidence_refs_json: str = "[]",
+        next_step: str | None = None,
+    ) -> str:
+        """Record a concise visible decision rationale, not hidden chain-of-thought."""
+
+        return runtime.record_reasoning_summary(
+            episode_id=episode_id,
+            summary=summary,
+            linked_hypothesis_id=linked_hypothesis_id,
+            linked_candidate_id=linked_candidate_id,
+            evidence_refs_json=evidence_refs_json,
+            next_step=next_step,
+        )
+
+    @agent.tool_plain
+    def inspect_optimization_toolset(kernel_id: str) -> str:
+        """Return available optimization levers, constraints, defaults, and evidence."""
+
+        return runtime.inspect_optimization_toolset(kernel_id=kernel_id)
+
+    @agent.tool_plain(name="propose_candidate_from_toolset", requires_approval=True)
+    def propose_candidate_from_toolset(
+        kernel_id: str,
+        kind: str,
+        changes_json: str,
+        description: str,
+        expected_effect: str,
+        hypothesis_id: str | None = None,
+    ) -> str:
+        """Create a validator-backed candidate from agent-selected toolset levers."""
+
+        return runtime.propose_candidate_from_toolset(
+            kernel_id=kernel_id,
+            kind=kind,
+            changes_json=changes_json,
+            description=description,
+            expected_effect=expected_effect,
+            hypothesis_id=hypothesis_id,
+        )
+
     @agent.tool_plain
     def propose_candidates(
         kernel_id: str,
@@ -603,11 +649,49 @@ def build_optimizer_agent(
 
         return runtime.run_candidate(candidate_json=candidate_json, meta_json=meta_json)
 
+    @agent.tool_plain(name="run_baseline_benchmark", requires_approval=True)
+    def run_baseline_benchmark(
+        episode_id: str,
+        kernel_id: str,
+        workload_json: str = "{}",
+    ) -> str:
+        """Compile and record baseline evidence for an episode workload."""
+
+        return runtime.run_baseline_benchmark(
+            episode_id=episode_id,
+            kernel_id=kernel_id,
+            workload_json=workload_json,
+        )
+
+    @agent.tool_plain(name="run_candidate_benchmark", requires_approval=True)
+    def run_candidate_benchmark(
+        episode_id: str,
+        candidate_json: str,
+        workload_json: str = "{}",
+    ) -> str:
+        """Compile, validate, and record candidate benchmark evidence for an episode."""
+
+        return runtime.run_candidate_benchmark(
+            episode_id=episode_id,
+            candidate_json=candidate_json,
+            workload_json=workload_json,
+        )
+
     @agent.tool_plain
     def compare_runs(baseline_id: str, candidate_ids_json: str) -> str:
         """Compare compile outcomes and artifact availability for candidate runs."""
 
         return runtime.compare_runs(baseline_id=baseline_id, candidate_ids_json=candidate_ids_json)
+
+    @agent.tool_plain
+    def compare_benchmarks(episode_id: str, baseline_id: str, candidate_ids_json: str) -> str:
+        """Compare benchmark evidence records by id and emit an auditable judgment."""
+
+        return runtime.compare_benchmarks(
+            episode_id=episode_id,
+            baseline_id=baseline_id,
+            candidate_ids_json=candidate_ids_json,
+        )
 
     @agent.tool_plain(name="accept_or_reject_candidate", requires_approval=True)
     def accept_or_reject_candidate(
@@ -615,6 +699,8 @@ def build_optimizer_agent(
         candidate_id: str,
         status: str,
         rationale: str,
+        evidence_ids_json: str = "[]",
+        compile_only: bool = False,
     ) -> str:
         """Record the agent's judgment for a candidate."""
 
@@ -623,6 +709,8 @@ def build_optimizer_agent(
             candidate_id=candidate_id,
             status=status,
             rationale=rationale,
+            evidence_ids_json=evidence_ids_json,
+            compile_only=compile_only,
         )
 
     @agent.tool_plain(name=_WRITE_REPORT_TOOL, requires_approval=True)
