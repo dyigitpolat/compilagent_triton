@@ -62,16 +62,25 @@ def test_candidate_policy_uses_memory_then_generic_fallback(tmp_path) -> None:
 
     candidates = policy.propose(kernel_id="vector_add", objective="optimize add", budget=2)
 
+    # Only the prior is returned; the legacy hand-coded fallback is gone.
+    # Fresh exploration goes through `inspect_search_space` (the typed
+    # derivation registry), not a static list embedded in the policy.
     assert candidates[0].changes["LOAD_CACHE_MODIFIER"] == ".cg"
-    assert len(candidates) == 2
+    assert len(candidates) == 1
 
 
-def test_candidate_policy_generic_without_evidence(tmp_path) -> None:
+def test_candidate_policy_returns_empty_without_evidence(tmp_path) -> None:
+    """No experiment memory + no static fallback ⇒ no candidates from the policy.
+
+    Discovery now happens through `inspect_search_space` (the typed derivation
+    registry on the active backend), which is invoked by the agent — not by
+    the policy.
+    """
+
     candidates = CandidatePolicy(ExperimentMemory(tmp_path)).propose(
         kernel_id="unknown",
         objective="explore",
         budget=2,
     )
 
-    assert len(candidates) == 2
-    assert all(candidate.description == "Generic meta-parameter exploration candidate" for candidate in candidates)
+    assert candidates == []

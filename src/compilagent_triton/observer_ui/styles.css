@@ -48,7 +48,7 @@ html, body {
 }
 body {
   display: grid;
-  grid-template-rows: var(--topbar-h) auto auto 1fr var(--bottombar-h);
+  grid-template-rows: var(--topbar-h) auto auto auto 1fr var(--bottombar-h);
   min-height: 100vh;
 }
 
@@ -85,6 +85,16 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent-1); backg
   border: 1px solid var(--line-strong); box-shadow: var(--shadow-1);
 }
 .topbar-controls { display: flex; align-items: end; gap: 10px; flex: 1; min-width: 0; flex-wrap: wrap; }
+
+/* control-bar — moved out of the topbar, sits beneath the GPU row */
+.control-bar {
+  display: flex; align-items: end; gap: 12px;
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.control-bar .btn-primary { align-self: end; }
 .ctl { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .ctl span { font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-2); font-weight: 600; }
 .ctl-wide select { min-width: 180px; }
@@ -305,7 +315,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent-1); backg
   .tool-grid { grid-template-columns: 1fr; }
 }
 .msg .msg-content {
-  color: var(--fg-1); font-size: 12px; line-height: 1.5;
+  color: var(--fg-1); font-size: 12px; line-height: 1.25;
   word-break: break-word;
 }
 .msg .msg-content em { color: var(--fg-2); font-style: normal; font-size: 10px;
@@ -313,12 +323,33 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent-1); backg
 .msg .msg-content pre, .msg pre {
   margin: 0; padding: 7px 10px; background: var(--bg-1);
   border: 1px solid var(--line); border-radius: var(--radius-1);
-  font-family: var(--mono); font-size: 10.5px; line-height: 1.5;
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.4;
   overflow: auto; max-height: 320px;
 }
 .msg .msg-content code, .msg code { font-family: var(--mono); font-size: 10.5px; }
-.msg .msg-content p { margin: 0 0 4px; }
+/* Tight markdown rendering — keep paragraphs/lists/headers close together. */
+.msg .msg-content p { margin: 0 0 2px; line-height: 1.3; }
 .msg .msg-content p:last-child { margin-bottom: 0; }
+.msg .msg-content ul, .msg .msg-content ol {
+  margin: 2px 0; padding-left: 18px;
+}
+.msg .msg-content li { margin: 0; line-height: 1.3; }
+.msg .msg-content li > p { margin: 0; }
+.msg .msg-content li + li { margin-top: 1px; }
+.msg .msg-content h1, .msg .msg-content h2, .msg .msg-content h3,
+.msg .msg-content h4, .msg .msg-content h5, .msg .msg-content h6 {
+  margin: 4px 0 2px; line-height: 1.2;
+}
+.msg .msg-content h1 { font-size: 14px; }
+.msg .msg-content h2 { font-size: 13px; }
+.msg .msg-content h3, .msg .msg-content h4,
+.msg .msg-content h5, .msg .msg-content h6 { font-size: 12px; }
+.msg .msg-content blockquote {
+  margin: 2px 0; padding: 1px 8px;
+  border-left: 2px solid var(--line-strong); color: var(--fg-2);
+}
+.msg .msg-content hr { margin: 4px 0; border: 0; border-top: 1px solid var(--line); }
+.msg .msg-content br { display: block; content: ""; margin-top: 0; }
 
 /* per-kind border tint */
 .msg-thinking { border-left-color: var(--accent-3); }
@@ -429,6 +460,24 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent-1); backg
 .insight-plot h4 { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
   color: var(--fg-2); margin: 0 0 6px; font-weight: 600; }
 
+/* compiled-artifacts card */
+.artifact-list { display: flex; flex-direction: column; gap: 10px; }
+.artifact-group h4 { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--fg-2); margin: 0 0 4px; font-weight: 600; font-family: var(--mono); }
+.artifact-row {
+  display: grid; grid-template-columns: 70px 1fr auto;
+  gap: 8px; align-items: center;
+  padding: 3px 6px; border-radius: 4px; font-family: var(--mono); font-size: 11px;
+}
+.artifact-row:hover { background: var(--bg-1); }
+.artifact-stage { color: var(--fg-2); font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.04em; font-weight: 600; }
+.artifact-name { color: var(--fg-1); text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-name:hover { color: var(--accent-4); text-decoration: underline; }
+.artifact-dl { color: var(--fg-2); text-decoration: none; padding: 0 6px; }
+.artifact-dl:hover { color: var(--accent-4); }
+
 /* code highlight tone-down */
 pre code.hljs { padding: 0 !important; background: transparent !important; }
 
@@ -467,6 +516,7 @@ pre code.hljs { padding: 0 !important; background: transparent !important; }
 @media (max-width: 880px) {
   .topbar { flex-wrap: wrap; height: auto; padding: 8px; }
   .topbar-controls { width: 100%; }
+  .control-bar { padding: 8px; }
 }
 @media (max-width: 540px) {
   .run-strip { grid-template-columns: 1fr; }

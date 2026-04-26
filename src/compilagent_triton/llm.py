@@ -116,8 +116,15 @@ def model_for_settings(settings: CompilagentSettings) -> Any:
     else:
         base = name
 
-    max_attempts = int(os.environ.get("COMPILAGENT_RETRY_MAX_ATTEMPTS", "6"))
-    return _build_retrying_model(base, max_attempts=max_attempts)
+    max_attempts = int(os.environ.get("COMPILAGENT_RETRY_MAX_ATTEMPTS", "8"))
+    base_seconds = float(os.environ.get("COMPILAGENT_RETRY_BASE_SECONDS", "2.0"))
+    max_seconds = float(os.environ.get("COMPILAGENT_RETRY_MAX_SECONDS", "60.0"))
+    return _build_retrying_model(
+        base,
+        max_attempts=max_attempts,
+        base_seconds=base_seconds,
+        max_seconds=max_seconds,
+    )
 
 
 # Map our internal reasoning effort to Anthropic's adaptive-thinking effort

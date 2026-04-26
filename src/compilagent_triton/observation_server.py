@@ -45,6 +45,32 @@ def create_app(*, workspace_root: Path | None = None) -> FastAPI:
     app.state.active_run_id = None
     app.state.runtime_config = _runtime_config(root.parent)
 
+    # Eagerly register backends + workloads so `/api/workloads` and the
+    # backend selector are populated on first request. We log failures rather
+    # than swallow them silently — that's why the user saw an empty dropdown
+    # without any clue what went wrong.
+    import logging as _logging
+
+    app.state.startup_errors = []
+    log = _logging.getLogger("compilagent.observer")
+    try:
+        from .backends import import_backend_packages  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        msg = f"backends package import failed: {exc!r}"
+        log.warning(msg)
+        app.state.startup_errors.append(msg)
+    else:
+        imported = import_backend_packages()
+        if not imported:
+            app.state.startup_errors.append("no backend subpackages registered")
+    try:
+        from .workloads.registry import import_workload_packages
+        import_workload_packages()
+    except Exception as exc:  # noqa: BLE001
+        msg = f"workload registry import failed: {exc!r}"
+        log.warning(msg)
+        app.state.startup_errors.append(msg)
+
     if UI_DIR.exists():
         app.mount("/assets", StaticFiles(directory=UI_DIR), name="assets")
 
@@ -81,6 +107,96 @@ def create_app(*, workspace_root: Path | None = None) -> FastAPI:
     def examples() -> dict[str, Any]:
         return {"examples": list_examples()}
 
+    @app.get("/api/workloads/diagnostics")
+    def workload_diagnostics() -> dict[str, Any]:
+        """Surface startup-time registry errors so the UI can show them."""
+        return {"startup_errors": list(getattr(app.state, "startup_errors", []))}
+
+    @app.get("/api/workloads/{workload_id}/source")
+    def workload_source(workload_id: str) -> dict[str, Any]:
+        """Return the workload module's Python source — the "JIT source" view.
+
+        For Triton kernel workloads this is the kernel module file. For
+        PyTorch full_model workloads it's the builder module (which contains
+        the `nn.Module` model construction code), which is what the agent and
+        the user mean by "the model's JIT source" — the actual Python that's
+        about to be handed to `torch.compile`.
+        """
+
+        import inspect as _inspect
+        import importlib
+
+        from .workloads.registry import workload_registry, import_workload_packages
+
+        import_workload_packages()
+        try:
+            spec = workload_registry.get_spec(workload_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        module_path, _, fn_name = spec.entrypoint.partition(":")
+        try:
+            module = importlib.import_module(module_path)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "workload_id": workload_id, "source_kind": "missing",
+                "language": "python",
+                "warning": f"could not import workload module `{module_path}`: {exc!r}",
+                "source": "",
+            }
+        try:
+            file_path = _inspect.getsourcefile(module) or ""
+            text = Path(file_path).read_text(encoding="utf-8") if file_path else _inspect.getsource(module)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "workload_id": workload_id, "source_kind": "missing",
+                "language": "python",
+                "warning": f"could not read workload source: {exc!r}",
+                "source": "",
+            }
+        return {
+            "workload_id": workload_id,
+            "source_kind": "workload",
+            "language": "python",
+            "source_path": file_path,
+            "symbol": fn_name or None,
+            "source": text,
+            "line_count": text.count("\n") + (1 if text else 0),
+        }
+
+    @app.get("/api/workloads")
+    def workloads() -> dict[str, Any]:
+        """List workloads from the new backend-agnostic registry.
+
+        Each entry includes the workload spec (typed shape/dtype/budget/tolerance)
+        plus the active backend's artifact_stages so the UI can show the right
+        Compiler-tab vocabulary per workload.
+        """
+
+        from .backends import backend_registry, import_backend_packages
+        from .workloads.registry import import_workload_packages, workload_registry
+
+        # Make sure self-registering modules ran. Idempotent.
+        import_workload_packages()
+        import_backend_packages()
+
+        out: list[dict[str, Any]] = []
+        for spec in workload_registry.specs():
+            entry = spec.serialize()
+            try:
+                backend = backend_registry.get(spec.backend_id)
+                entry["backend"] = {
+                    "id": backend.id,
+                    "artifact_stages": list(backend.artifact_stages),
+                    "device": {
+                        "arch": backend.device_capability().arch,
+                        "name": backend.device_capability().name,
+                    },
+                }
+            except KeyError:
+                entry["backend"] = {"id": spec.backend_id, "available": False}
+            out.append(entry)
+        return {"workloads": out, "registered_backends": backend_registry.ids()}
+
     @app.get("/api/examples/{example_id}")
     def example(example_id: str, max_chars: int = Query(default=40_000, ge=1000, le=200_000)) -> dict[str, Any]:
         try:
@@ -104,12 +220,33 @@ def create_app(*, workspace_root: Path | None = None) -> FastAPI:
 
     @app.post("/api/runtime/config")
     def update_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"harness", "mode", "model"}
+        from .backends import backend_registry
+
+        allowed = {
+            "harness", "mode", "model", "backend", "workload_id", "max_candidates",
+        }
         updates = {key: value for key, value in config.items() if key in allowed}
+        if "max_candidates" in updates:
+            try:
+                n = int(updates["max_candidates"])
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400, detail="max_candidates must be an integer >= 1"
+                )
+            if n < 1 or n > 32:
+                raise HTTPException(
+                    status_code=400, detail="max_candidates must be in [1, 32]"
+                )
+            updates["max_candidates"] = n
         if "harness" in updates and updates["harness"] not in {"pydantic_ai", "claude_agent_sdk"}:
             raise HTTPException(status_code=400, detail="unsupported harness")
         if "mode" in updates and updates["mode"] not in {"benchmark", "optimize"}:
             raise HTTPException(status_code=400, detail="unsupported mode")
+        if "backend" in updates and updates["backend"] not in backend_registry.ids():
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown backend; registered: {backend_registry.ids()}",
+            )
         if "model" in updates:
             new_model = str(updates["model"])
             if ":" not in new_model:
@@ -145,6 +282,68 @@ def create_app(*, workspace_root: Path | None = None) -> FastAPI:
         trace_store.emit("run.requested", payload=payload)
         background_tasks.add_task(_run_example_task, app, request.model_copy(update={"config": config}), run_id)
         return {"run_id": run_id, "status": "queued"}
+
+    @app.post("/api/runs/workload")
+    def start_workload_run(
+        config: dict[str, Any], background_tasks: BackgroundTasks,
+    ) -> dict[str, Any]:
+        from .workloads.registry import workload_registry, import_workload_packages
+
+        import_workload_packages()
+        workload_id = str(config.get("workload_id") or "").strip()
+        if not workload_id:
+            raise HTTPException(status_code=400, detail="workload_id is required")
+        try:
+            spec = workload_registry.get_spec(workload_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if app.state.active_run_id is not None:
+            raise HTTPException(status_code=409, detail="a run is already active")
+        # Resolve max_candidates: per-request override > runtime_config > default 4.
+        try:
+            max_candidates = int(
+                config.get("max_candidates")
+                or app.state.runtime_config.get("max_candidates")
+                or 4
+            )
+        except (TypeError, ValueError):
+            max_candidates = 4
+        max_candidates = max(1, min(32, max_candidates))
+        # Resolve harness: per-request override > runtime_config > "pydantic_ai".
+        harness = str(
+            config.get("harness")
+            or app.state.runtime_config.get("harness")
+            or "pydantic_ai"
+        )
+        if harness not in {"pydantic_ai", "claude_agent_sdk"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown harness `{harness}`",
+            )
+        from datetime import UTC, datetime
+        from uuid import uuid4
+        run_id = (
+            f"{workload_id.replace('_', '-')}-"
+            f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:8]}"
+        )
+        payload = {
+            "run_id": run_id,
+            "workload_id": workload_id,
+            "backend_id": spec.backend_id,
+            "kind": "workload",
+            "max_candidates": max_candidates,
+            "harness": harness,
+        }
+        app.state.runs[run_id] = {"status": "queued", **payload}
+        app.state.active_run_id = run_id
+        trace_store.emit("run.requested", payload=payload)
+        background_tasks.add_task(
+            _run_workload_task, app, workload_id, run_id, max_candidates, harness,
+        )
+        return {
+            "run_id": run_id, "status": "queued",
+            "max_candidates": max_candidates, "harness": harness,
+        }
 
     @app.get("/api/runs/{run_id}")
     def run_status(run_id: str) -> dict[str, Any]:
@@ -351,6 +550,44 @@ async def _event_stream(trace_store: TraceStore, *, after: str | None = None) ->
             last_event_id = event.event_id
             yield f"id: {event.event_id}\nevent: {event.kind}\ndata: {event.model_dump_json()}\n\n"
         await asyncio.sleep(1.0)
+
+
+def _run_workload_task(
+    app: FastAPI, workload_id: str, run_id: str, max_candidates: int = 4,
+    harness: str = "pydantic_ai",
+) -> None:
+    """Drive the backend-agnostic workload runner in a background task.
+
+    `harness` selects the agent driver — either pydantic-ai (default) or the
+    Claude Agent SDK. Both share the same `WorkloadSession` tool surface so
+    backend / workload / model dispatch is identical between them.
+    """
+
+    trace_store: TraceStore = app.state.trace_store
+    root: Path = app.state.workspace_root
+    try:
+        app.state.runs[run_id] = {**app.state.runs.get(run_id, {}), "status": "running"}
+        from .workload_runner import run_workload_optimization
+
+        run_workload_optimization(
+            workload_id=workload_id,
+            run_id=run_id,
+            workspace_root=root,
+            trace_store=trace_store,
+            max_candidates=max_candidates,
+            harness=harness,
+        )
+        app.state.runs[run_id] = {**app.state.runs.get(run_id, {}), "status": "completed"}
+    except Exception as exc:
+        app.state.runs[run_id] = {
+            **app.state.runs.get(run_id, {}),
+            "status": "failed",
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
+    finally:
+        if app.state.active_run_id == run_id:
+            app.state.active_run_id = None
 
 
 def _run_example_task(app: FastAPI, request: RunRequest, run_id: str) -> None:
@@ -594,12 +831,31 @@ def _language_for_suffix(suffix: str) -> str:
 
 
 def _safe_artifact_path(root: Path, artifact_path: str) -> Path:
-    path = (root / artifact_path).resolve()
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail="artifact path escapes workspace") from exc
-    return path
+    """Resolve `artifact_path` to a real file under `root`.
+
+    The UI's URL builder strips leading slashes (so absolute paths arrive here
+    as `home/yigit/...`). We try both shapes — first as an absolute path (by
+    re-prepending the slash), then as a relative path under `root`. Either way
+    the final resolved path must live inside `root` so we don't leak files
+    outside the workspace.
+    """
+
+    candidates: list[Path] = []
+    raw = artifact_path or ""
+    if raw.startswith("/"):
+        candidates.append(Path(raw).resolve())
+    else:
+        candidates.append(Path("/" + raw).resolve())
+        candidates.append((root / raw).resolve())
+
+    root_resolved = root.resolve()
+    for path in candidates:
+        try:
+            path.relative_to(root_resolved)
+        except ValueError:
+            continue
+        return path
+    raise HTTPException(status_code=403, detail="artifact path escapes workspace")
 
 
 def _to_int(value: str) -> int | None:

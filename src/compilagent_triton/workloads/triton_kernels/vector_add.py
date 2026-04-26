@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from .trace_store import TraceStore
+from ...trace_store import TraceStore
 
 try:
     import triton
@@ -400,3 +400,74 @@ def _comparison_conclusion(speedup: float | None) -> str:
 
 if __name__ == "__main__":
     main()
+
+
+# --- workload registration ---------------------------------------------------
+
+from ...core.workload import (
+    BenchmarkBudget,
+    DtypePolicy,
+    ShapePolicy,
+    ToleranceConfig,
+    WorkloadInstance,
+    WorkloadKind,
+    WorkloadSpec,
+)
+from ..registry import register_workload
+
+
+_VECTOR_ADD_SPEC = WorkloadSpec(
+    id="vector_add",
+    title="Vector Add",
+    description="Masked elementwise add Triton kernel.",
+    kind=WorkloadKind.KERNEL,
+    backend_id="triton",
+    entrypoint="compilagent_triton.workloads.triton_kernels.vector_add:build_workload",
+    dtype_policy=DtypePolicy(activation_dtype="fp32", param_dtype="fp32"),
+    shape_policy=ShapePolicy(extra={"n_elements": 8_388_608}),
+    tolerance=ToleranceConfig(atol=1e-5, rtol=1e-4),
+    budget=BenchmarkBudget(warmup=5, repetitions=20, max_seconds=120),
+    metadata={
+        "kernel_symbol": "vector_add_kernel",
+        "source_path": __file__,
+    },
+)
+
+
+@register_workload(_VECTOR_ADD_SPEC)
+def build_workload(spec: WorkloadSpec) -> WorkloadInstance:
+    """Materialise a vector_add launch with a single launch as `forward`."""
+
+    import torch  # local to keep import-time light when CUDA is absent
+
+    n = int(spec.shape_policy.extra.get("n_elements", 1024 * 1024))
+    block_size = int(spec.metadata.get("block_size", 1024))
+    num_warps = int(spec.metadata.get("num_warps", 4))
+    dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[
+        spec.dtype_policy.activation_dtype
+    ]
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required to materialise vector_add.")
+    x = torch.randn(n, device="cuda", dtype=dtype)
+    y = torch.randn(n, device="cuda", dtype=dtype)
+    out = torch.empty_like(x)
+
+    def grid(meta):
+        return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+
+    def forward():
+        vector_add_kernel[grid](
+            x, y, out, n,
+            BLOCK_SIZE=block_size,
+            LOAD_CACHE_MODIFIER="",
+            num_warps=num_warps,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    return WorkloadInstance(
+        spec=spec,
+        forward=forward,
+        example_inputs=(x, y),
+        metadata={"output_buffer": out, "n_elements": n},
+    )

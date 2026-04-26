@@ -101,6 +101,8 @@ async def _run_agent_optimization_async(
     agent = _build_observer_agent(runtime=runtime, settings=settings, workspace=workspace)
     prompt = _starter_prompt(example=example, episode_id=episode_id)
 
+    # Per-run part counters (TraceStore uses slots; pass by reference).
+    part_counters: dict[str, int] = {"thinking": 0, "text": 0}
     trace_store.emit(
         "agent.run_started",
         episode_id=episode_id,
@@ -128,6 +130,7 @@ async def _run_agent_optimization_async(
                             trace_store=trace_store,
                             episode_id=episode_id,
                             run_id=run_id,
+                            counters=part_counters,
                         )
                 elif Agent.is_call_tools_node(node):
                     async with node.stream(agent_run.ctx) as stream:
@@ -178,15 +181,32 @@ async def _stream_model_response(
     trace_store: TraceStore,
     episode_id: str | None,
     run_id: str,
+    counters: dict[str, int],
 ) -> None:
+    """Same monotonic-part_id discipline as workload_runner._stream_model_response.
+
+    `counters` is a per-run dict shared across calls so part_ids stay monotonic
+    across multiple model responses.
+    """
+
+    part_ids: dict[tuple[str, int], int] = {}
+
+    def _assign(kind: str, idx: int) -> int:
+        key = (kind, idx)
+        if key not in part_ids:
+            counters[kind] += 1
+            part_ids[key] = counters[kind]
+        return part_ids[key]
+
     async for event in stream:
         if isinstance(event, PartStartEvent):
             part = event.part
             if isinstance(part, ThinkingPart):
+                pid = _assign("thinking", event.index)
                 trace_store.emit(
                     "agent.thinking_started",
                     episode_id=episode_id,
-                    payload={"run_id": run_id, "index": event.index},
+                    payload={"run_id": run_id, "index": event.index, "part_id": pid},
                 )
                 if part.content:
                     trace_store.emit(
@@ -195,14 +215,16 @@ async def _stream_model_response(
                         payload={
                             "run_id": run_id,
                             "index": event.index,
+                            "part_id": pid,
                             "delta": part.content,
                         },
                     )
             elif isinstance(part, TextPart):
+                pid = _assign("text", event.index)
                 trace_store.emit(
                     "agent.text_started",
                     episode_id=episode_id,
-                    payload={"run_id": run_id, "index": event.index},
+                    payload={"run_id": run_id, "index": event.index, "part_id": pid},
                 )
                 if part.content:
                     trace_store.emit(
@@ -211,36 +233,39 @@ async def _stream_model_response(
                         payload={
                             "run_id": run_id,
                             "index": event.index,
+                            "part_id": pid,
                             "delta": part.content,
                         },
                     )
             elif isinstance(part, ToolCallPart):
-                # Tool call args arrive in deltas; the assembled call is surfaced
-                # via FunctionToolCallEvent in _stream_tool_events instead.
                 continue
         elif isinstance(event, PartDeltaEvent):
             delta = event.delta
             if isinstance(delta, ThinkingPartDelta):
                 content = getattr(delta, "content_delta", None)
                 if content:
+                    pid = _assign("thinking", event.index)
                     trace_store.emit(
                         "agent.thinking_delta",
                         episode_id=episode_id,
                         payload={
                             "run_id": run_id,
                             "index": event.index,
+                            "part_id": pid,
                             "delta": content,
                         },
                     )
             elif isinstance(delta, TextPartDelta):
                 content = getattr(delta, "content_delta", None)
                 if content:
+                    pid = _assign("text", event.index)
                     trace_store.emit(
                         "agent.text_delta",
                         episode_id=episode_id,
                         payload={
                             "run_id": run_id,
                             "index": event.index,
+                            "part_id": pid,
                             "delta": content,
                         },
                     )
@@ -372,6 +397,20 @@ def _build_observer_agent(
         """Inspect the optimization toolset (levers, constraints, evidence) for a kernel."""
 
         return runtime.inspect_optimization_toolset(kernel_id=kernel_id)
+
+    @agent.tool_plain
+    def inspect_search_space(kernel_id: str, backend_id: str = "triton") -> str:
+        """Inspect the **derived** search space for a kernel + backend.
+
+        Returns a list of typed levers whose ranges are computed automatically
+        from the workload's analysis (tensor shapes, IR diffs, op counts) and
+        the active device capability. Each lever cites the signal that
+        produced it. Use this in preference to `inspect_optimization_toolset`
+        for new candidate proposals — it scales across backends and never
+        emits hand-coded value lists.
+        """
+
+        return runtime.inspect_search_space(kernel_id=kernel_id, backend_id=backend_id)
 
     @agent.tool_plain
     @_retry_on_value_error
@@ -570,21 +609,24 @@ def _starter_prompt(*, example: Any, episode_id: str | None) -> str:
         lines.append(f"Active episode id: `{episode_id}` is already started.")
     lines.append("")
     lines.append(
-        "You have two complementary intervention surfaces:\n"
-        "  (a) launch-meta candidates (BLOCK_SIZE, num_warps, num_stages, cache modifiers)\n"
-        "      via `inspect_optimization_toolset` + `propose_candidate_from_toolset`;\n"
-        "  (b) compiler-pass interventions (skip a pass, change pass parameters such as\n"
-        "      tritongpu-pipeline num_stages) via `list_compiler_passes` +\n"
-        "      `describe_compiler_pass` + `read_pass_source` + `propose_pass_intervention`.\n"
-        "Surface (b) lets you actually change Triton's MLIR optimization decisions, not\n"
-        "just sweep launch hyperparameters."
+        "You have three complementary surfaces:\n"
+        "  (a) `inspect_search_space` (preferred) — derived levers with auto-computed\n"
+        "      bounds and `evidence` citing the signal that produced each lever\n"
+        "      (tensor shape, IR diff, op count, device capability). Use this first;\n"
+        "      every lever's range comes from the workload analysis, not a list.\n"
+        "  (b) `inspect_optimization_toolset` + `propose_candidate_from_toolset` —\n"
+        "      legacy launch-meta surface kept for compatibility.\n"
+        "  (c) compiler-pass interventions via `list_compiler_passes` +\n"
+        "      `describe_compiler_pass` + `read_pass_source` + `propose_pass_intervention`\n"
+        "      to change Triton's MLIR optimization decisions, not just sweep\n"
+        "      launch hyperparameters."
     )
     lines.append("")
     lines.append(
         "Workflow:\n"
         "1. Compile and benchmark the baseline.\n"
-        "2. Inspect the IR (inspect_ir, summarize_decisions) and the available levers\n"
-        "   (inspect_optimization_toolset, list_compiler_passes).\n"
+        "2. Inspect the IR (inspect_ir, summarize_decisions) and the derived search\n"
+        "   space (inspect_search_space).\n"
         "3. Record a grounded hypothesis explaining the bottleneck.\n"
         "4. Propose 1-3 high-signal candidates — prefer pass interventions when the\n"
         "   bottleneck looks structural (layout, pipelining, coalescing).\n"

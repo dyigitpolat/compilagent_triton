@@ -484,6 +484,56 @@ class OptimizerRuntime:
             pass
         return 80  # safe default
 
+    def inspect_search_space(self, kernel_id: str, *, backend_id: str = "triton") -> str:
+        """Return the *derived* lever catalog for the active backend.
+
+        Unlike `inspect_optimization_toolset` (the legacy hand-coded surface),
+        every lever returned here carries `range.candidates` automatically
+        computed from the workload's analysis (tensor shapes, op counts, IR
+        diffs) plus the device capability. The lever's `evidence` field cites
+        the signal that produced it. **No hand-coded value lists are emitted.**
+        """
+
+        import json as _json
+        from .backends import backend_registry
+        from .backends.base import Analysis
+
+        with self.observe_tool(
+            "inspect_search_space",
+            payload={"kernel_id": kernel_id, "backend_id": backend_id},
+        ):
+            spec = self.require_kernel(kernel_id)
+            backend = backend_registry.get(backend_id)
+            cap = backend.device_capability()
+            compile_results = [r for r in self.compile_results.values() if r.kernel_id == kernel_id]
+            artifacts: list = []
+            for r in compile_results:
+                artifacts.extend(r.artifacts)
+            analysis = backend.analyze(spec, baseline_artifacts=artifacts)
+            # Enrich with the device-capability + a (possibly empty) pass-impact log
+            extra = dict(analysis.extra)
+            extra.setdefault("device_capability_int", cap.capability_int)
+            analysis = Analysis(summary=analysis.summary, extra=extra)
+            search_space = backend.derive_search_space(spec, analysis)
+            payload = {
+                "workload_id": getattr(spec, "id", kernel_id),
+                "backend_id": backend.id,
+                "device": {
+                    "arch": cap.arch,
+                    "name": cap.name,
+                    "capability_int": cap.capability_int,
+                    "memory_total_bytes": cap.memory_total_bytes,
+                    "peak_bandwidth_gbps": cap.memory_peak_bandwidth_gbps,
+                },
+                "levers": [lev.serialize() for lev in search_space.levers],
+                "usage_hint": (
+                    "Each lever's `range.candidates` is derived; pick from those values "
+                    "or interpolate within the typed bounds. The `evidence` field cites "
+                    "the signal that produced the lever."
+                ),
+            }
+            return _json.dumps(payload, indent=2)
+
     def inspect_optimization_toolset(self, kernel_id: str) -> str:
         """Return available optimization levers, constraints, defaults, and evidence.
 
@@ -1092,6 +1142,7 @@ class OptimizerRuntime:
                 payload={
                     "candidate_id": candidate_id,
                     "stage": stage,
+                    "name": result.name,
                     "pass": result.name,
                     "action": result.action,
                     "duration_ms": result.duration_ms,

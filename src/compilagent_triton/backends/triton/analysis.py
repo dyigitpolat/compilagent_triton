@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from .schemas import DecisionKind, DecisionTrace
+from ...schemas import DecisionKind, DecisionTrace
 
 _LOAD_STORE_RE = re.compile(r"\btt\.(load|store)\b")
 _DOT_RE = re.compile(r"\btt\.dot(?:_scaled)?\b|\bttng\.tc_gen5_mma\b")

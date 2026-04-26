@@ -245,7 +245,7 @@ def _registry() -> dict[str, ExampleSpec]:
             title="Vector Add",
             description="Masked elementwise add with block size, warp count, and load cache modifier sweeps.",
             kernel_family="vector_add",
-            source_path=PACKAGE_DIR / "gpu_benchmarks.py",
+            source_path=PACKAGE_DIR / "workloads" / "triton_kernels" / "vector_add.py",
             entrypoint="run_vector_add_sweep",
             kernel_symbol="vector_add_kernel",
             supported_knobs=["block_sizes", "num_warps", "load_cache_modifiers"],
@@ -263,7 +263,7 @@ def _registry() -> dict[str, ExampleSpec]:
             title="Vector Copy",
             description="Contiguous vector copy sweep focused on memory throughput and launch configuration.",
             kernel_family="vector_copy",
-            source_path=PACKAGE_DIR / "gpu_copy_benchmarks.py",
+            source_path=PACKAGE_DIR / "workloads" / "triton_kernels" / "vector_copy.py",
             entrypoint="run_copy_sweep",
             kernel_symbol="copy_kernel",
             supported_knobs=["block_sizes", "num_warps"],
@@ -280,7 +280,7 @@ def _registry() -> dict[str, ExampleSpec]:
             title="Reduction Sum",
             description="Block-level sum reduction focused on masks, vector width, and memory-layout evidence.",
             kernel_family="reduction",
-            source_path=PACKAGE_DIR / "gpu_reduction_benchmarks.py",
+            source_path=PACKAGE_DIR / "workloads" / "triton_kernels" / "reduction_sum.py",
             entrypoint="run_reduction_sweep",
             kernel_symbol="reduction_sum_kernel",
             supported_knobs=["block_sizes", "num_warps"],
@@ -297,7 +297,7 @@ def _registry() -> dict[str, ExampleSpec]:
             title="Matmul",
             description="Reserved for a reliable matmul optimization harness.",
             kernel_family="matmul",
-            source_path=PACKAGE_DIR / "gpu_benchmarks.py",
+            source_path=PACKAGE_DIR / "workloads" / "triton_kernels" / "vector_add.py",
             entrypoint="not_implemented",
             kernel_symbol=None,
             supported_knobs=[],
@@ -319,7 +319,10 @@ def _runner_for(example_id: str) -> Callable[[RunConfig, Path, str], dict[str, A
 
 
 def _run_vector_add(config: RunConfig, workspace_root: Path, run_id: str) -> dict[str, Any]:
-    from .gpu_benchmarks import render_vector_add_report, run_vector_add_sweep
+    from .workloads.triton_kernels.vector_add import (
+        render_vector_add_report,
+        run_vector_add_sweep,
+    )
 
     results = run_vector_add_sweep(
         n_elements=config.n_elements,
@@ -341,7 +344,7 @@ def _run_vector_add(config: RunConfig, workspace_root: Path, run_id: str) -> dic
 
 
 def _run_vector_copy(config: RunConfig, workspace_root: Path, run_id: str) -> dict[str, Any]:
-    from .gpu_copy_benchmarks import render_copy_report, run_copy_sweep
+    from .workloads.triton_kernels.vector_copy import render_copy_report, run_copy_sweep
 
     results = run_copy_sweep(
         n_elements=config.n_elements,
@@ -362,7 +365,10 @@ def _run_vector_copy(config: RunConfig, workspace_root: Path, run_id: str) -> di
 
 
 def _run_reduction_sum(config: RunConfig, workspace_root: Path, run_id: str) -> dict[str, Any]:
-    from .gpu_reduction_benchmarks import render_reduction_report, run_reduction_sweep
+    from .workloads.triton_kernels.reduction_sum import (
+        render_reduction_report,
+        run_reduction_sweep,
+    )
 
     results = run_reduction_sweep(
         n_elements=config.n_elements,

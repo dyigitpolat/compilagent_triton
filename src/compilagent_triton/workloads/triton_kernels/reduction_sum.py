@@ -14,7 +14,7 @@ import triton.language as tl
 
 import triton
 
-from .trace_store import TraceStore
+from ...trace_store import TraceStore
 
 
 @triton.jit
@@ -255,3 +255,61 @@ def _fmt(value: float | None, *, digits: int = 6) -> str:
 
 if __name__ == "__main__":
     main()
+
+
+# --- workload registration ---------------------------------------------------
+
+from ...core.workload import (
+    BenchmarkBudget,
+    DtypePolicy,
+    ShapePolicy,
+    ToleranceConfig,
+    WorkloadInstance,
+    WorkloadKind,
+    WorkloadSpec,
+)
+from ..registry import register_workload
+
+
+_REDUCTION_SPEC = WorkloadSpec(
+    id="reduction_sum",
+    title="Reduction Sum",
+    description="Block-level sum reduction Triton kernel.",
+    kind=WorkloadKind.KERNEL,
+    backend_id="triton",
+    entrypoint="compilagent_triton.workloads.triton_kernels.reduction_sum:build_workload",
+    dtype_policy=DtypePolicy(activation_dtype="fp32", param_dtype="fp32"),
+    shape_policy=ShapePolicy(extra={"n_elements": 8_388_608}),
+    tolerance=ToleranceConfig(atol=1e-4, rtol=1e-4),
+    budget=BenchmarkBudget(warmup=10, repetitions=50, max_seconds=120),
+    metadata={"kernel_symbol": "reduction_sum_kernel", "source_path": __file__},
+)
+
+
+@register_workload(_REDUCTION_SPEC)
+def build_workload(spec: WorkloadSpec) -> WorkloadInstance:
+    import torch
+
+    n = int(spec.shape_policy.extra.get("n_elements", 1024 * 1024))
+    block_size = int(spec.metadata.get("block_size", 1024))
+    num_warps = int(spec.metadata.get("num_warps", 4))
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required to materialise reduction_sum.")
+    x = torch.randn(n, device="cuda", dtype=torch.float32)
+    grid_size = triton.cdiv(n, block_size)
+    partials = torch.empty(grid_size, device="cuda", dtype=torch.float32)
+
+    def grid(meta):
+        return (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+
+    def forward():
+        reduction_sum_kernel[grid](
+            x, partials, n, BLOCK_SIZE=block_size, num_warps=num_warps,
+        )
+        torch.cuda.synchronize()
+        return partials
+
+    return WorkloadInstance(
+        spec=spec, forward=forward, example_inputs=(x,),
+        metadata={"output_buffer": partials, "n_elements": n},
+    )

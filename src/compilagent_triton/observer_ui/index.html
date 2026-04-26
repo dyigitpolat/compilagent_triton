@@ -19,42 +19,48 @@
           <small id="topbar-subtitle">agentic compiler optimization</small>
         </div>
       </div>
-      <div class="topbar-controls">
-        <label class="ctl">
-          <span>Harness</span>
-          <select id="harness-select">
-            <option value="pydantic_ai">pydantic-ai</option>
-            <option value="claude_agent_sdk">Claude Agent SDK</option>
-          </select>
-        </label>
-        <label class="ctl ctl-wide">
-          <span>Model</span>
-          <select id="model-select">
-            <option value="mistral:mistral-large-latest">mistral · large-latest</option>
-            <option value="mistral:mistral-medium-latest">mistral · medium-latest</option>
-            <option value="mistral:mistral-small-latest">mistral · small-latest</option>
-            <option value="anthropic:claude-opus-4-7">anthropic · opus-4.7</option>
-            <option value="anthropic:claude-sonnet-4-6">anthropic · sonnet-4.6</option>
-            <option value="anthropic:claude-haiku-4-5">anthropic · haiku-4.5</option>
-            <option value="openai:gpt-5.1">openai · gpt-5.1</option>
-          </select>
-        </label>
-        <label class="ctl ctl-wide">
-          <span>Example</span>
-          <select id="example-select"></select>
-        </label>
-        <button id="run-button" class="btn btn-primary" type="button">
-          <span class="btn-label">Run</span>
-        </button>
-      </div>
       <div class="topbar-status">
         <span id="conn-pill" class="pill pill-muted">connecting…</span>
+        <span id="backend-pill" class="pill pill-muted">backend n/a</span>
         <span id="model-pill" class="pill pill-muted">model n/a</span>
         <span id="effort-pill" class="pill pill-muted">effort n/a</span>
       </div>
     </header>
 
     <div class="gpu-row" id="topbar-gpus"></div>
+
+    <div class="control-bar" id="control-bar">
+      <label class="ctl">
+        <span>Harness</span>
+        <select id="harness-select">
+          <option value="pydantic_ai">pydantic-ai</option>
+          <option value="claude_agent_sdk">Claude Agent SDK</option>
+        </select>
+      </label>
+      <label class="ctl ctl-wide">
+        <span>Model</span>
+        <select id="model-select">
+          <option value="mistral:mistral-large-latest">mistral · large-latest</option>
+          <option value="mistral:mistral-medium-latest">mistral · medium-latest</option>
+          <option value="mistral:mistral-small-latest">mistral · small-latest</option>
+          <option value="anthropic:claude-opus-4-7">anthropic · opus-4.7</option>
+          <option value="anthropic:claude-sonnet-4-6">anthropic · sonnet-4.6</option>
+          <option value="anthropic:claude-haiku-4-5">anthropic · haiku-4.5</option>
+          <option value="openai:gpt-5.1">openai · gpt-5.1</option>
+        </select>
+      </label>
+      <label class="ctl ctl-wide">
+        <span>Workload</span>
+        <select id="workload-select"></select>
+      </label>
+      <label class="ctl">
+        <span>Trials</span>
+        <input id="max-candidates-input" type="number" min="1" max="32" step="1" value="4" />
+      </label>
+      <button id="run-button" class="btn btn-primary" type="button">
+        <span class="btn-label">Run</span>
+      </button>
+    </div>
 
     <div class="run-strip">
       <div class="run-strip-meta">
@@ -73,19 +79,6 @@
         <span class="stat-mini"><small>candidates</small><strong id="metric-candidates">0</strong></span>
         <span class="stat-mini"><small>passes</small><strong id="metric-passes">0</strong></span>
       </div>
-      <details id="run-config-details" class="run-config">
-        <summary>Run config</summary>
-        <div class="run-config-grid">
-          <label><span>n_elements</span><input id="cfg-n-elements" type="number" min="1024" /></label>
-          <label><span>repetitions</span><input id="cfg-repetitions" type="number" min="1" /></label>
-          <label><span>warmup</span><input id="cfg-warmup" type="number" min="0" /></label>
-          <label><span>max seconds</span><input id="cfg-max-seconds" type="number" min="1" /></label>
-          <label><span>block sizes</span><input id="cfg-block-sizes" type="text" placeholder="256,512,1024" /></label>
-          <label><span>num_warps</span><input id="cfg-num-warps" type="text" placeholder="4,8" /></label>
-          <label><span>cache modifiers</span><input id="cfg-cache-modifiers" type="text" placeholder="none,.ca,.cg" /></label>
-          <label><span>gpu_index</span><input id="cfg-gpu-index" type="number" placeholder="auto" /></label>
-        </div>
-      </details>
     </div>
 
     <main class="workspace">

@@ -18,6 +18,9 @@ const state = {
   passes: new Map(),
   telemetry: [],
   artifacts: [],
+  artifactManifest: [],
+  finalSummary: null,
+  bestSpeedupSoFar: null,
   source: null,
   irRuns: [],
   ws: null,
@@ -26,6 +29,8 @@ const state = {
   followMode: true,
   smoothScrollRaf: 0,
   smoothScrollProgrammatic: false,
+  workloads: [],
+  selectedWorkloadId: null,
 };
 
 // ----- helpers -----
@@ -90,7 +95,7 @@ async function init() {
   bindScrollFollow();
   await Promise.all([
     loadRuntimeConfig(),
-    loadExamples(),
+    loadWorkloads(),
     loadTelemetry(),
   ]);
   connectWebSocket();
@@ -101,7 +106,8 @@ async function init() {
 function bindUi() {
   $('#harness-select').addEventListener('change', onConfigChange);
   $('#model-select').addEventListener('change', onConfigChange);
-  $('#example-select').addEventListener('change', () => selectExample($('#example-select').value));
+  $('#workload-select').addEventListener('change', () => selectWorkload($('#workload-select').value));
+  $('#max-candidates-input').addEventListener('change', onConfigChange);
   $('#run-button').addEventListener('click', startRun);
   $('#clear-stream').addEventListener('click', clearStream);
   $$('#filter-chips .chip').forEach((c) => c.addEventListener('click', () => {
@@ -123,6 +129,9 @@ function clearStream() {
   state.passes.clear();
   state.collapsed.clear();
   state.irRuns = [];
+  state.artifactManifest = [];
+  state.finalSummary = null;
+  state.bestSpeedupSoFar = null;
   $('#stream').innerHTML = '';
   // Always seed with the source kernel as the first card.
   insertSourceCard();
@@ -132,11 +141,12 @@ function clearStream() {
 async function onConfigChange() {
   const harness = $('#harness-select').value;
   const model = $('#model-select').value;
+  const max_candidates = Math.max(1, Math.min(32, Number($('#max-candidates-input').value) || 4));
   try {
     state.runtimeConfig = await fetchJson('/api/runtime/config', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ harness, model, mode: 'optimize' }),
+      body: JSON.stringify({ harness, model, mode: 'optimize', max_candidates }),
     });
     renderRuntimeChrome();
   } catch (err) { console.error(err); }
@@ -146,42 +156,71 @@ async function loadRuntimeConfig() {
   try { state.runtimeConfig = await fetchJson('/api/runtime/config'); } catch (e) { console.error(e); }
 }
 
-async function loadExamples() {
+async function loadWorkloads() {
+  const sel = $('#workload-select');
   try {
-    const data = await fetchJson('/api/examples');
-    state.examples = data.examples || [];
-    const sel = $('#example-select');
-    sel.innerHTML = state.examples.map((ex) =>
-      `<option value="${escapeAttr(ex.id)}">${escapeHtml(ex.title)}${ex.enabled ? '' : ' (disabled)'}</option>`,
-    ).join('');
-    if (state.examples.length) await selectExample((state.examples.find((e) => e.enabled) || state.examples[0]).id);
-  } catch (e) { console.error(e); }
+    const data = await fetchJson('/api/workloads');
+    state.workloads = data.workloads || [];
+    sel.innerHTML = state.workloads.map((w) => {
+      const backend = w.backend?.id || w.backend_id;
+      const label = `${w.title} · ${backend}`;
+      return `<option value="${escapeAttr(w.id)}">${escapeHtml(label)}</option>`;
+    }).join('');
+    if (state.workloads.length) {
+      const def = state.workloads.find((w) => w.id === 'vit_block') || state.workloads[0];
+      await selectWorkload(def.id);
+    } else {
+      // Empty registry — fetch diagnostics so we can tell the user WHY.
+      sel.innerHTML = '<option value="">(no workloads registered)</option>';
+      try {
+        const diag = await fetchJson('/api/workloads/diagnostics');
+        const errs = diag.startup_errors || [];
+        if (errs.length) {
+          $('#run-status').textContent = `Workload registry empty — ${errs.length} startup error(s); see console`;
+          console.warn('compilagent-observe startup errors:\n' + errs.join('\n'));
+        } else {
+          $('#run-status').textContent = 'Workload registry empty (no startup errors reported); restart the server.';
+        }
+      } catch { /* ignore */ }
+    }
+  } catch (err) {
+    console.error('loadWorkloads', err);
+    sel.innerHTML = '<option value="">(failed to load /api/workloads)</option>';
+    $('#run-status').textContent = `Failed to load workloads: ${err.message}`;
+  }
 }
 
-async function selectExample(id) {
-  state.selectedExampleId = id;
-  $('#example-select').value = id;
-  const ex = state.examples.find((e) => e.id === id);
-  if (!ex) return;
-  $('#run-button').disabled = !ex.enabled;
-  $('#run-status').textContent = ex.enabled ? `Selected ${ex.title}.` : ex.disabled_reason || 'Example disabled.';
-  setRunControls(ex.default_config || {}, ex.supported_knobs || []);
-  try { state.source = await fetchJson(`/api/examples/${encodeURIComponent(id)}/kernel`); }
-  catch { state.source = null; }
+async function selectWorkload(id) {
+  state.selectedWorkloadId = id;
+  $('#workload-select').value = id;
+  const w = state.workloads.find((x) => x.id === id);
+  if (!w) return;
+  $('#backend-pill').textContent = `backend: ${w.backend?.id || w.backend_id}`;
+  $('#run-status').textContent = `Workload selected: ${w.title}.`;
+  // For triton-kernel workloads we still have an /api/examples/{id}/kernel
+  // preview available; for full-model workloads there's no single-symbol view
+  // (the agent will see the FX graph + output_code via the IR browser).
+  state.source = null;
+  if (w.kind === 'kernel') {
+    // Triton kernel workloads still come with a Triton-aware AST extractor
+    // that returns just the @triton.jit function body.
+    try {
+      state.source = await fetchJson(`/api/examples/${encodeURIComponent(id)}/kernel`);
+    } catch { state.source = null; }
+  }
+  // For everything else (full_model / fused_subgraph), fall back to the
+  // workload module's full Python source — that's the "JIT source" the user
+  // means: the nn.Module + builder code that gets handed to torch.compile.
+  if (!state.source || !state.source.source) {
+    try {
+      state.source = await fetchJson(`/api/workloads/${encodeURIComponent(id)}/source`);
+    } catch { state.source = state.source || null; }
+  }
   insertSourceCard();
 }
 
-function setRunControls(config, knobs) {
-  $('#cfg-n-elements').value = config.n_elements ?? 8388608;
-  $('#cfg-repetitions').value = config.repetitions ?? 20;
-  $('#cfg-warmup').value = config.warmup ?? 5;
-  $('#cfg-max-seconds').value = config.max_benchmark_seconds ?? 120;
-  $('#cfg-block-sizes').value = (config.block_sizes || []).join(',');
-  $('#cfg-num-warps').value = (config.num_warps || []).join(',');
-  $('#cfg-cache-modifiers').value = (config.load_cache_modifiers || ['']).map((c) => c || 'none').join(',');
-  $('#cfg-cache-modifiers').disabled = !knobs.includes('load_cache_modifiers');
-  $('#cfg-gpu-index').value = config.gpu_index ?? '';
-}
+// `loadExamples` / `selectExample` / `setRunControls` are gone — the
+// example dropdown was retired in favour of the workload registry.
 
 async function loadTelemetry() {
   try {
@@ -242,7 +281,14 @@ function ingestEvent(ev) {
     state.runs[payload.run_id] = {
       ...state.runs[payload.run_id], status: 'running',
       kind: kind === 'agent.run_started' ? 'agent' : 'benchmark',
+      max_candidates: payload.max_candidates ?? state.runs[payload.run_id]?.max_candidates,
+      successful_count: 0,
+      failed_attempts: 0,
     };
+    // Reset the best-so-far tracker; "new best found" cards stream during
+    // the run, while the full Insights / IR / Artifacts cards are only
+    // appended at terminal events.
+    state.bestSpeedupSoFar = null;
     pushItem({
       key: `run-${payload.run_id}`, kind: 'system', filter: 'all', ts,
       title: kind === 'agent.run_started' ? 'Agent run started' : 'Benchmark run started',
@@ -257,13 +303,27 @@ function ingestEvent(ev) {
       contentHtml: `<small class="muted">elapsed ${fmtMs(payload.elapsed_ms)}</small>`,
     });
     appendIrCard();
+    appendArtifactsCard();
     appendInsightsCard();
+    if (payload.final_text) appendFinalSummaryCard(payload.final_text);
   } else if (kind === 'run.completed') {
     if (state.runs[payload.run_id]) state.runs[payload.run_id].status = 'completed';
     appendIrCard();
+    appendArtifactsCard();
     appendInsightsCard();
+    if (payload.final_text) appendFinalSummaryCard(payload.final_text);
+  } else if (kind === 'run.progress') {
+    const r = state.runs[payload.run_id] || (state.runs[payload.run_id] = {});
+    r.successful_count = payload.successful_count ?? r.successful_count ?? 0;
+    r.failed_attempts = payload.failed_attempts ?? r.failed_attempts ?? 0;
+    if (typeof payload.max_candidates === 'number') r.max_candidates = payload.max_candidates;
   } else if (kind === 'agent.run_failed' || kind === 'run.failed') {
     if (state.runs[payload.run_id]) state.runs[payload.run_id].status = 'failed';
+    // Surface partial insights / IR / artifacts even on failure so the user
+    // sees what was collected before the run blew up.
+    appendIrCard();
+    appendArtifactsCard();
+    appendInsightsCard();
     pushItem({
       key: `run-fail-${payload.run_id}-${ev.event_id}`, kind: 'error', filter: 'all', ts,
       title: 'Run failed', pillLabel: 'fail', pillClass: 'pill-status failed',
@@ -271,10 +331,14 @@ function ingestEvent(ev) {
     });
 
   } else if (kind === 'agent.thinking_started') {
-    // Defer card creation until first delta — avoids empty caret cards.
-    state.thinkingActiveKey = `thk-${payload.run_id}-${payload.index}`;
+    // Use the server-assigned monotonic part_id so each new model response
+    // opens a fresh card. Defer card creation until first delta — avoids
+    // empty caret cards.
+    const sub = (payload.part_id != null) ? `p${payload.part_id}` : `i${payload.index ?? 0}`;
+    state.thinkingActiveKey = `thk-${payload.run_id}-${sub}`;
   } else if (kind === 'agent.thinking_delta') {
-    const key = state.thinkingActiveKey || `thk-${payload.run_id}-${payload.index || 0}`;
+    const sub = (payload.part_id != null) ? `p${payload.part_id}` : `i${payload.index ?? 0}`;
+    const key = `thk-${payload.run_id}-${sub}`;
     state.thinkingActiveKey = key;
     if (!(payload.delta || '').length) return;
     appendToItem(key, payload.delta || '', {
@@ -282,9 +346,11 @@ function ingestEvent(ev) {
       title: 'thinking', pillLabel: 'thinking', pillClass: 'pill-thinking',
     });
   } else if (kind === 'agent.text_started') {
-    state.textActiveKey = `txt-${payload.run_id}-${payload.index}`;
+    const sub = (payload.part_id != null) ? `p${payload.part_id}` : `i${payload.index ?? 0}`;
+    state.textActiveKey = `txt-${payload.run_id}-${sub}`;
   } else if (kind === 'agent.text_delta') {
-    const key = state.textActiveKey || `txt-${payload.run_id}-${payload.index || 0}`;
+    const sub = (payload.part_id != null) ? `p${payload.part_id}` : `i${payload.index ?? 0}`;
+    const key = `txt-${payload.run_id}-${sub}`;
     state.textActiveKey = key;
     if (!(payload.delta || '').length) return;
     appendToItem(key, payload.delta || '', {
@@ -389,6 +455,23 @@ function ingestEvent(ev) {
         }
       });
     }
+    // Stream a lightweight "new best found" card whenever the latest
+    // benchmark beats the prior best. The full performance-insights summary
+    // is only appended at terminal events; here we just flag the milestone.
+    const sp = (payload.best && payload.best.speedup_vs_baseline)
+            ?? payload.speedup_vs_baseline;
+    if (typeof sp === 'number' && sp > 1.0
+        && (state.bestSpeedupSoFar === null || sp > state.bestSpeedupSoFar)) {
+      state.bestSpeedupSoFar = sp;
+      const pct = ((sp - 1.0) * 100).toFixed(1);
+      const sign = sp >= 1.0 ? '+' : '';
+      pushItem({
+        key: `best-${ev.event_id}`, kind: 'best', filter: 'benchmark', ts,
+        title: `New best · ${cid || ''} (${sign}${pct}%)`,
+        pillLabel: 'best', pillClass: 'pill-insight',
+        contentHtml: `<div class="msg-content"><strong>${fmtSpeedup(sp)}</strong> · median ${fmtMs(payload.best && payload.best.median_ms)}</div>`,
+      });
+    }
   } else if (kind === 'comparison.created') {
     pushItem({
       key: `cmp-${ev.event_id}`, kind: 'comparison', filter: 'benchmark', ts,
@@ -418,10 +501,21 @@ function ingestEvent(ev) {
     item.passes.push(payload);
     rerenderItem(item);
   } else if (kind === 'artifact.created') {
-    if (payload.path) state.artifacts = Array.from(new Set([payload.path, ...state.artifacts])).slice(0, 24);
-    if (payload.run_id && payload.path && /\.(ttir|ttgir|llir|ptx)$/i.test(payload.path)) {
+    if (payload.path) state.artifacts = Array.from(new Set([payload.path, ...state.artifacts])).slice(0, 64);
+    if (payload.path && !state.artifactManifest.find((a) => a.path === payload.path)) {
+      state.artifactManifest.push({
+        run_id: payload.run_id || '',
+        kernel_id: payload.kernel_id || '',
+        stage: payload.stage || '',
+        path: payload.path,
+      });
+    }
+    // Pick up both Triton MLIR artifacts and TorchInductor python/log artifacts.
+    const isInductor = /(output_code|fx_graph|schedule|fusion)\.(py|log)$/i.test(payload.path || '');
+    const isTriton = /\.(ttir|ttgir|llir|ptx|mlir)$/i.test(payload.path || '');
+    if (payload.run_id && payload.path && (isInductor || isTriton)) {
       if (!state.irRuns.find((r) => r.run_id === payload.run_id)) {
-        state.irRuns.push({ run_id: payload.run_id, kernel_id: payload.kernel_id });
+        state.irRuns.push({ run_id: payload.run_id, kernel_id: payload.kernel_id || '' });
       }
     }
   }
@@ -651,7 +745,7 @@ function renderItemContent(it) {
       const pct = ((p.duration_ms || 0) / max) * 100;
       const cls = p.action === 'skip' ? 'skipped' : '';
       return `<div class="pass-row ${cls}">
-        <span title="${escapeAttr(p.error || '')}">${escapeHtml(p.stage || '')} · ${escapeHtml(p.pass)}${p.error ? ' ⚠' : ''}</span>
+        <span title="${escapeAttr(p.error || '')}">${escapeHtml(p.stage || '')} · ${escapeHtml(p.name || p.pass || '')}${p.error ? ' ⚠' : ''}</span>
         <div class="pass-bar"><div class="pass-bar-fill" style="width:${pct}%"></div></div>
         <span>${(p.duration_ms || 0).toFixed(2)}ms</span>
       </div>`;
@@ -674,10 +768,17 @@ function renderItemContent(it) {
       <div class="ir-controls">
         <select data-role="ir-run">${opts || '<option value="">no compile runs yet</option>'}</select>
         <select data-role="ir-stage">
-          <option value="ttir">ttir</option>
-          <option value="ttgir" selected>ttgir</option>
-          <option value="llir">llir</option>
-          <option value="ptx">ptx</option>
+          <optgroup label="Triton">
+            <option value="ttir">ttir</option>
+            <option value="ttgir" selected>ttgir</option>
+            <option value="llir">llir</option>
+            <option value="ptx">ptx</option>
+          </optgroup>
+          <optgroup label="Inductor">
+            <option value="output_code">output_code (.py)</option>
+            <option value="fx_graph">fx_graph (.py)</option>
+            <option value="schedule_log">schedule (.log)</option>
+          </optgroup>
         </select>
         <button class="btn btn-ghost" type="button" data-action="load-ir">load</button>
       </div>
@@ -702,6 +803,40 @@ function renderItemContent(it) {
         <div class="insight-plot"><h4>Speedup over candidates</h4>${speedupPlot}</div>
         <div class="insight-plot"><h4>Per-pass duration (top 18)</h4>${passPlot}</div>
       </div>`;
+  }
+  if (it.kind === 'artifacts') {
+    const groups = (it.artifactManifest && it.artifactManifest.groups) || {};
+    const keys = Object.keys(groups);
+    if (!keys.length) {
+      return `<div class="msg-content muted">No compiled artifacts emitted yet.</div>`;
+    }
+    // Sort so "baseline" comes first, then candidates by id.
+    keys.sort((a, b) => (a === 'baseline' ? -1 : b === 'baseline' ? 1 : a.localeCompare(b)));
+    const sections = keys.map((runId) => {
+      const items = groups[runId] || [];
+      const rows = items.map((a) => {
+        const name = (a.path || '').split('/').pop() || a.path;
+        const previewHref = artifactPreviewUrl(a.path);
+        const downloadHref = artifactDownloadUrl(a.path);
+        return `<div class="artifact-row">
+          <span class="artifact-stage">${escapeHtml(a.stage || '')}</span>
+          <a class="artifact-name" href="${previewHref}" target="_blank" rel="noopener" title="${escapeAttr(a.path)}">${escapeHtml(name)}</a>
+          <a class="artifact-dl" href="${downloadHref}" download title="download">⬇</a>
+        </div>`;
+      }).join('');
+      return `<div class="artifact-group">
+        <h4>${escapeHtml(runId)} <small class="muted">(${items.length})</small></h4>
+        ${rows}
+      </div>`;
+    }).join('');
+    return `<div class="artifact-list">${sections}</div>`;
+  }
+  if (it.kind === 'final') {
+    const txt = it.finalText || '';
+    if (!txt.trim()) {
+      return `<div class="msg-content muted">No final report emitted.</div>`;
+    }
+    return `<div class="msg-content">${renderMarkdown(txt)}</div>`;
   }
   if (it.contentHtml) return it.contentHtml;
   return '';
@@ -829,6 +964,45 @@ function appendIrCard() {
   });
 }
 
+function appendArtifactsCard() {
+  // Group every artifact emitted during the run by its owning run_id (e.g.
+  // "baseline" or "cand-..."). The card lists each compiled artifact with a
+  // download link so the user can grab the produced output_code, ttgir, etc.
+  const groups = {};
+  for (const a of state.artifactManifest) {
+    const key = a.run_id || 'unknown';
+    (groups[key] ||= []).push(a);
+  }
+  const payload = { groups };
+  const cardKey = 'artifacts-card';
+  if (state.itemByKey.has(cardKey)) {
+    updateItem(cardKey, (it) => { it.artifactManifest = payload; });
+    return;
+  }
+  pushItem({
+    key: cardKey, kind: 'artifacts', filter: 'all',
+    ts: new Date().toISOString(),
+    title: 'Compiled artifacts',
+    pillLabel: 'artifacts', pillClass: 'pill-ir',
+    artifactManifest: payload,
+  });
+}
+
+function appendFinalSummaryCard(text) {
+  state.finalSummary = text;
+  const key = 'final-summary-card';
+  if (state.itemByKey.has(key)) {
+    updateItem(key, (it) => { it.finalText = text; });
+    return;
+  }
+  pushItem({
+    key, kind: 'final', filter: 'all',
+    ts: new Date().toISOString(),
+    title: 'Final report', pillLabel: 'report', pillClass: 'pill-summary',
+    finalText: text,
+  });
+}
+
 function appendInsightsCard() {
   const insight = computeInsights();
   const key = 'insights-card';
@@ -873,7 +1047,7 @@ function computeInsights() {
     for (const p of it.passes) {
       totalPasses++;
       passMs += p.duration_ms || 0;
-      passDurations.push({ name: p.pass, ms: p.duration_ms || 0, action: p.action });
+      passDurations.push({ name: p.name || p.pass, ms: p.duration_ms || 0, action: p.action });
     }
   }
   passDurations.sort((a, b) => b.ms - a.ms);
@@ -889,19 +1063,50 @@ function computeInsights() {
 }
 
 function renderSpeedupPlot(points) {
-  const w = 320, h = 100, pad = 18;
+  const w = 360, h = 140, padL = 36, padR = 14, padT = 14, padB = 22;
   if (!points.length) return `<svg viewBox="0 0 ${w} ${h}" width="100%"><text x="${w/2}" y="${h/2}" text-anchor="middle" fill="#5b6478" font-size="10">no measured candidates</text></svg>`;
-  const maxY = Math.max(1.5, ...points.map((p) => p.speedup));
-  const minY = Math.min(0.5, ...points.map((p) => p.speedup));
-  const xs = (i) => pad + (points.length === 1 ? (w - 2 * pad) / 2 : (i * (w - 2 * pad)) / (points.length - 1));
-  const ys = (v) => h - pad - ((v - minY) / (maxY - minY || 1)) * (h - 2 * pad);
+  // Min-max scale that ALWAYS includes 1.0 (the baseline reference) so the
+  // viewer can see at a glance whether each candidate is above or below it.
+  const speedups = points.map((p) => p.speedup);
+  const dataMax = Math.max(...speedups, 1.0);
+  const dataMin = Math.min(...speedups, 1.0);
+  const span = Math.max(dataMax - dataMin, 1e-3);
+  const headroom = span * 0.12;
+  const maxY = dataMax + headroom;
+  const minY = dataMin - headroom;
+  const xs = (i) => padL + (points.length === 1 ? (w - padL - padR) / 2 : (i * (w - padL - padR)) / (points.length - 1));
+  const ys = (v) => h - padB - ((v - minY) / (maxY - minY)) * (h - padT - padB);
+  // Color each dot by win/loss vs. baseline. Bright cyan = win, soft red = regression.
+  const dotColor = (sp) => sp >= 1.0 ? '#22d3ee' : '#f87171';
+  // Connecting line uses a neutral, less-bright color so the data points pop.
   const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${xs(i).toFixed(1)} ${ys(p.speedup).toFixed(1)}`).join(' ');
   const refY = ys(1.0).toFixed(1);
-  const dots = points.map((p, i) => `<circle cx="${xs(i).toFixed(1)}" cy="${ys(p.speedup).toFixed(1)}" r="2.5" fill="#5eead4"/>`).join('');
+  // Y-axis ticks at min, 1.0, max.
+  const fmt = (v) => v.toFixed(2) + '×';
+  const yMinTxt = fmt(minY + headroom);
+  const yMaxTxt = fmt(maxY - headroom);
+  const dots = points.map((p, i) => {
+    const cx = xs(i).toFixed(1);
+    const cy = ys(p.speedup).toFixed(1);
+    const pct = (p.speedup - 1.0) * 100;
+    const sign = pct >= 0 ? '+' : '';
+    const label = `${sign}${pct.toFixed(1)}%`;
+    const color = dotColor(p.speedup);
+    // Place the label above the point if it's below the line; below if it's above.
+    const below = p.speedup < 1.0;
+    const labelY = below ? (parseFloat(cy) + 12) : (parseFloat(cy) - 7);
+    return `
+      <circle cx="${cx}" cy="${cy}" r="3.6" fill="${color}" stroke="#0b0d12" stroke-width="0.6"/>
+      <text x="${cx}" y="${labelY.toFixed(1)}" text-anchor="middle"
+            fill="${color}" font-size="9" font-weight="600"
+            font-family="ui-monospace, monospace">${label}</text>`;
+  }).join('');
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">
-    <line x1="${pad}" x2="${w - pad}" y1="${refY}" y2="${refY}" stroke="#5b6478" stroke-dasharray="2,3" stroke-width="0.8"/>
-    <text x="${w - pad}" y="${refY - 3}" text-anchor="end" fill="#5b6478" font-size="9">1.0×</text>
-    <path d="${path}" fill="none" stroke="#5eead4" stroke-width="1.6"/>
+    <line x1="${padL}" x2="${w - padR}" y1="${refY}" y2="${refY}" stroke="#5b6478" stroke-dasharray="2,3" stroke-width="0.8"/>
+    <text x="${padL - 4}" y="${(parseFloat(refY) + 3).toFixed(1)}" text-anchor="end" fill="#8c97ac" font-size="9">1.00×</text>
+    <text x="${padL - 4}" y="${(padT + 4).toFixed(1)}" text-anchor="end" fill="#5b6478" font-size="8">${yMaxTxt}</text>
+    <text x="${padL - 4}" y="${(h - padB + 3).toFixed(1)}" text-anchor="end" fill="#5b6478" font-size="8">${yMinTxt}</text>
+    <path d="${path}" fill="none" stroke="#3b82f6" stroke-width="1.2" opacity="0.55"/>
     ${dots}
   </svg>`;
 }
@@ -931,12 +1136,23 @@ async function loadIrInline(it) {
   const runId = card.querySelector('[data-role="ir-run"]')?.value;
   const stage = card.querySelector('[data-role="ir-stage"]')?.value;
   if (!runId) { it.irMeta = 'select a compile run first'; rerenderItem(it); return; }
-  const artifact = state.artifacts.find((p) =>
-    p.includes(runId) && p.toLowerCase().endsWith('.' + stage.toLowerCase()));
+  // Map UI stage names to filename predicates for both Triton and Inductor.
+  const matchers = {
+    ttir: (p) => p.toLowerCase().endsWith('.ttir'),
+    ttgir: (p) => p.toLowerCase().endsWith('.ttgir'),
+    llir: (p) => p.toLowerCase().endsWith('.llir'),
+    ptx: (p) => p.toLowerCase().endsWith('.ptx'),
+    output_code: (p) => /output_code\.py$/i.test(p),
+    fx_graph: (p) => /fx_graph\.py$/i.test(p),
+    schedule_log: (p) => /schedule\.log$/i.test(p),
+  };
+  const matcher = matchers[stage] || ((p) => p.toLowerCase().endsWith('.' + stage.toLowerCase()));
+  const artifact = state.artifacts.find((p) => p.includes(runId) && matcher(p))
+    || state.artifacts.find((p) => matcher(p));
   if (!artifact) { it.irMeta = `no ${stage} artifact for ${runId}`; it.irText = ''; rerenderItem(it); return; }
   try {
     const data = await fetchJson(`${artifactPreviewUrl(artifact)}?max_chars=80000`);
-    it.irMeta = `${stage} · ${data.size_bytes} bytes`;
+    it.irMeta = `${stage} · ${data.size_bytes} bytes · ${artifact}`;
     it.irText = data.text || '(empty)';
     rerenderItem(it);
   } catch (e) { it.irMeta = e.message; rerenderItem(it); }
@@ -945,6 +1161,11 @@ async function loadIrInline(it) {
 function artifactPreviewUrl(path) {
   const segs = String(path || '').split('/').filter(Boolean).map(encodeURIComponent);
   return `/api/artifacts/preview/${segs.join('/')}`;
+}
+
+function artifactDownloadUrl(path) {
+  const segs = String(path || '').split('/').filter(Boolean).map(encodeURIComponent);
+  return `/api/artifacts/${segs.join('/')}`;
 }
 
 // ----- chrome -----
@@ -973,13 +1194,20 @@ function updateMetrics() {
   const runId = state.activeRunId;
   const run = runId ? state.runs[runId] : null;
   $('#run-id').textContent = runId || '';
+  // Progress = successful trials / max_candidates. Terminal states clamp to 100%
+  // so the bar visibly completes regardless of whether all slots were spent.
   let pct = 0;
   if (run) {
-    pct = run.status === 'completed' ? 100 : run.status === 'failed' ? 100 : 60;
+    const max = Math.max(1, run.max_candidates || 0);
+    const succ = Math.min(max, run.successful_count || 0);
+    pct = Math.round((succ / max) * 100);
+    if (run.status === 'completed' || run.status === 'failed') pct = 100;
+    const succLabel = `${succ}/${max} successful`;
+    const failPart = (run.failed_attempts || 0) > 0 ? ` · ${run.failed_attempts} failed` : '';
     $('#run-status').textContent =
-      run.status === 'failed' ? 'Failed.'
-      : run.status === 'completed' ? 'Completed.'
-      : 'Running…';
+      run.status === 'failed' ? `Failed (${succLabel}${failPart}).`
+      : run.status === 'completed' ? `Completed (${succLabel}${failPart}).`
+      : `Running… ${succLabel}${failPart}`;
   }
   $('#run-progress-fill').style.width = `${pct}%`;
   $('#run-progress-pct').textContent = `${pct}%`;
@@ -995,6 +1223,9 @@ function renderRuntimeChrome() {
     if ([...sel.options].some((o) => o.value === c.model)) {
       sel.value = c.model;
     }
+  }
+  if (typeof c.max_candidates === 'number' && c.max_candidates >= 1) {
+    $('#max-candidates-input').value = c.max_candidates;
   }
   $('#model-pill').textContent = c.model || 'model n/a';
   $('#effort-pill').textContent = c.reasoning_effort ? `effort: ${c.reasoning_effort}` : 'effort n/a';
@@ -1031,8 +1262,7 @@ function renderTelemetry() {
 // ----- run start -----
 
 async function startRun() {
-  const exampleId = state.selectedExampleId;
-  if (!exampleId) return;
+  const workloadId = state.selectedWorkloadId;
   // Wipe the conversation client-side immediately so old cards disappear before the
   // first event of the new run lands.
   clearStream();
@@ -1040,24 +1270,20 @@ async function startRun() {
   button.disabled = true;
   $('#run-status').textContent = 'Submitting run…';
   try {
-    const config = {
-      n_elements: Number($('#cfg-n-elements').value),
-      repetitions: Number($('#cfg-repetitions').value),
-      warmup: Number($('#cfg-warmup').value),
-      max_benchmark_seconds: Number($('#cfg-max-seconds').value),
-      block_sizes: parseList($('#cfg-block-sizes').value),
-      num_warps: parseList($('#cfg-num-warps').value),
-      load_cache_modifiers: parseStringList($('#cfg-cache-modifiers').value),
-      gpu_index: $('#cfg-gpu-index').value === '' ? null : Number($('#cfg-gpu-index').value),
-    };
-    const r = await fetchJson('/api/runs', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ example_id: exampleId, mode: 'optimize', config }),
-    });
-    state.activeRunId = r.run_id;
-    $('#run-id').textContent = r.run_id;
-    $('#run-status').textContent = `Queued ${r.run_id}`;
+    if (workloadId) {
+      const max_candidates = Math.max(1, Math.min(32, Number($('#max-candidates-input').value) || 4));
+      const harness = $('#harness-select').value || (state.runtimeConfig && state.runtimeConfig.harness) || 'pydantic_ai';
+      const r = await fetchJson('/api/runs/workload', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ workload_id: workloadId, mode: 'optimize', max_candidates, harness }),
+      });
+      state.activeRunId = r.run_id;
+      $('#run-id').textContent = r.run_id;
+      $('#run-status').textContent = `Queued ${r.run_id}`;
+    } else {
+      $('#run-status').textContent = 'No workload selected.';
+    }
   } catch (e) {
     $('#run-status').textContent = e.message;
   } finally {

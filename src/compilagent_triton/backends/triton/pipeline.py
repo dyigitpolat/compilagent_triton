@@ -41,6 +41,11 @@ class PassIntervention:
     args: dict[str, Any] = field(default_factory=dict)
     """Override args by parameter name (matched against PassDescriptor.params)."""
     rationale: str = ""
+    ir_rewriter: Callable[[str], str] | None = None
+    """Optional callable: takes the IR text **before** this pass runs, returns
+    the rewritten IR text. The pipeline re-parses the result and feeds it to
+    the pass. Lets the agent inject layout / encoding rewrites that no built-in
+    pass produces. Skipped if `action == "skip"`."""
 
     def model_dump(self) -> dict[str, Any]:
         return {
@@ -48,6 +53,7 @@ class PassIntervention:
             "action": self.action,
             "args": dict(self.args),
             "rationale": self.rationale,
+            "has_ir_rewriter": self.ir_rewriter is not None,
         }
 
 
@@ -84,6 +90,35 @@ class PipelinePlan:
             capability=self.capability,
             steps=list(self.steps),
             interventions=out,
+        )
+
+    def reorder(self, names: list[str]) -> PipelinePlan:
+        """Return a new plan whose steps are reordered to match `names`.
+
+        Steps not in `names` are dropped (or kept at the tail if `names` is a
+        prefix). Unknown names in `names` are ignored. The result is a fresh
+        plan with the same interventions; pass-args are preserved.
+        """
+
+        by_name: dict[str, PipelinePlanStep] = {}
+        for step in self.steps:
+            by_name.setdefault(step.descriptor.name, step)
+        new_steps: list[PipelinePlanStep] = []
+        seen: set[str] = set()
+        for name in names:
+            if name in by_name and name not in seen:
+                new_steps.append(by_name[name])
+                seen.add(name)
+        # If the caller supplied a prefix, append the rest in original order.
+        if seen and len(seen) < len(by_name):
+            for step in self.steps:
+                if step.descriptor.name not in seen:
+                    new_steps.append(step)
+        return PipelinePlan(
+            stage=self.stage,
+            capability=self.capability,
+            steps=new_steps or list(self.steps),
+            interventions=dict(self.interventions),
         )
 
     def names(self) -> list[str]:
@@ -317,13 +352,29 @@ def execute_plan(
             continue
 
         callable_obj = callable_for(step.descriptor)
-        # For action="replace" the agent is expected to have provided a
-        # `replace_with` field via interventions; today we only support the
-        # built-in pass selection. Future: allow a python callable shipped with
-        # the intervention. For now treat "replace" as run.
         pm = ir.pass_manager(mod.context)
         if options.capture_ir:
             pm.enable_debug()
+
+        # Inter-pass IR rewriter: if the intervention supplies an `ir_rewriter`,
+        # apply it to the IR text *before* the pass runs. The rewritten text is
+        # parsed back into a fresh module that replaces `mod` for this pass and
+        # all subsequent ones. Errors here are reported but don't abort the run.
+        rewriter_error: str | None = None
+        if intervention is not None and intervention.ir_rewriter is not None and action != "skip":
+            try:
+                pre_text = mod.str()
+                new_text = intervention.ir_rewriter(pre_text)
+                if new_text and new_text != pre_text:
+                    new_mod = ir.parse_mlir_module(new_text, mod.context)
+                    if new_mod is not None:
+                        # Triton's pass manager mutates whatever we pass in.
+                        # Replace the in-place reference for the remainder of
+                        # the pipeline by pointing `mod` at the new module.
+                        mod = new_mod
+                        last_ir = new_text
+            except Exception as exc:  # noqa: BLE001
+                rewriter_error = f"ir_rewriter: {type(exc).__name__}: {exc}"
 
         try:
             callable_obj(pm, *args)
@@ -333,11 +384,11 @@ def execute_plan(
             ) from exc
 
         started = time.perf_counter()
-        error: str | None = None
+        error: str | None = rewriter_error
         try:
             pm.run(mod, f"compilagent::{step.descriptor.name}")
         except Exception as exc:  # noqa: BLE001
-            error = f"{type(exc).__name__}: {exc}"
+            error = f"{type(exc).__name__}: {exc}" if not error else f"{error}; pass: {exc}"
         duration_ms = (time.perf_counter() - started) * 1000.0
 
         ir_after: str | None = None
