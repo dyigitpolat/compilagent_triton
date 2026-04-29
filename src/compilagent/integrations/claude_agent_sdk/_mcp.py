@@ -47,8 +47,13 @@ def create_optimizer_mcp_server(toolset: Toolset, *, server_name: str = "compila
 
         @tool_decorator(decl.name, decl.description, decl.args_schema, annotations=ann)
         async def _handler(args: dict[str, Any], *, _decl=decl) -> dict[str, Any]:
+            # Route through `ToolDecl.invoke`, which validates the wire
+            # dict against the auto-derived Pydantic args model before
+            # calling the typed handler. Pydantic validation errors come
+            # back as `ValueError` so the agent gets a retryable tool
+            # error instead of an opaque crash.
             try:
-                result = _decl.handler(args)
+                result = _decl.invoke(args or {})
             except ValueError as exc:
                 return _error_response(exc)
             except Exception as exc:  # noqa: BLE001

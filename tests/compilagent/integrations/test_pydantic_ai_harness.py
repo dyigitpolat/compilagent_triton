@@ -160,18 +160,16 @@ def test_self_registration_installs_harness():
 # ------------------------------------------------------------- tool adapter
 
 
-def test_tool_adapter_builds_function_with_matching_signature():
-    """`make_pydantic_ai_tool_fn` produces a function with the right params."""
+def test_tool_adapter_passes_through_typed_handler():
+    """The pydantic-ai adapter returns the handler's typed signature
+    intact so pydantic-ai introspects it directly."""
 
     from compilagent.integrations.pydantic_ai._tool_adapter import (
         make_pydantic_ai_tool_fn,
     )
 
-    captured: dict = {}
-
-    def _handler(args: dict) -> str:
-        captured.update(args)
-        return json.dumps({"ok": True})
+    def _typed_handler(*, candidate_id: str, note: str = "") -> str:
+        return json.dumps({"id": candidate_id, "note": note})
 
     decl = ToolDecl(
         name="run_thing",
@@ -185,7 +183,7 @@ def test_tool_adapter_builds_function_with_matching_signature():
             "required": ["candidate_id"],
             "additionalProperties": False,
         },
-        handler=_handler,
+        handler=_typed_handler,
         read_only=False,
     )
     fn = make_pydantic_ai_tool_fn(decl)
@@ -193,52 +191,50 @@ def test_tool_adapter_builds_function_with_matching_signature():
     assert fn.__doc__ == "Run a thing."
 
     import inspect
-    sig = inspect.signature(fn)
+
+    sig = inspect.signature(fn, eval_str=True)
     assert list(sig.parameters.keys()) == ["candidate_id", "note"]
-    assert sig.parameters["candidate_id"].default is inspect.Parameter.empty
-    assert sig.parameters["note"].default == ""
+    # The annotation comes from the bound handler — typed `str`, not the
+    # synthesised string type from any schema.
+    assert sig.parameters["candidate_id"].annotation is str
 
     result = fn(candidate_id="cand-123", note="hi")
-    assert json.loads(result) == {"ok": True}
-    assert captured == {"candidate_id": "cand-123", "note": "hi"}
+    assert json.loads(result) == {"id": "cand-123", "note": "hi"}
 
 
-def test_tool_adapter_no_args_schema():
-    from compilagent.integrations.pydantic_ai._tool_adapter import (
-        make_pydantic_ai_tool_fn,
-    )
+def test_tool_decl_invoke_validates_via_args_model():
+    """`ToolDecl.invoke` validates the wire dict through `args_model`
+    before calling the typed handler with kwargs."""
 
-    decl = ToolDecl(
-        name="ping",
-        description="Ping.",
-        args_schema={"type": "object", "properties": {}, "additionalProperties": False},
-        handler=lambda _args: "pong",
-        read_only=True,
-    )
-    fn = make_pydantic_ai_tool_fn(decl)
-    import inspect
-    assert list(inspect.signature(fn).parameters.keys()) == []
-    assert fn() == "pong"
+    from pydantic import BaseModel, Field
 
+    class _Args(BaseModel):
+        items: list[int] = Field(...)
+        label: str = ""
 
-def test_tool_adapter_rejects_non_string_property():
-    from compilagent.integrations.pydantic_ai._tool_adapter import (
-        make_pydantic_ai_tool_fn,
-    )
+    captured: dict = {}
+
+    def _handler(*, items: list[int], label: str = "") -> str:
+        captured["items"] = items
+        captured["label"] = label
+        return "ok"
 
     decl = ToolDecl(
-        name="bad",
-        description="Bad.",
-        args_schema={
-            "type": "object",
-            "properties": {"count": {"type": "integer"}},
-            "required": [],
-        },
-        handler=lambda _args: "",
-        read_only=True,
+        name="batch",
+        description="Take typed args",
+        args_schema=_Args.model_json_schema(),
+        handler=_handler,
+        args_model=_Args,
+        read_only=False,
     )
-    with pytest.raises(ValueError, match="unsupported type"):
-        make_pydantic_ai_tool_fn(decl)
+    out = decl.invoke({"items": [1, 2, 3], "label": "x"})
+    assert out == "ok"
+    assert captured == {"items": [1, 2, 3], "label": "x"}
+
+    # Wire-dict validation surfaces Pydantic errors as ValueError so
+    # adapters can fold them into a retryable tool error.
+    with pytest.raises(ValueError):
+        decl.invoke({"items": "not-a-list"})
 
 
 # --------------------------------------------------------- model settings

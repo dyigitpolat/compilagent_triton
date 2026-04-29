@@ -42,6 +42,11 @@ const state = {
   gpu: { gpus: [], lastFetchedAt: null, hasGpu: false },
 
   selectedWorkloadId: null,
+  // Terminal status for the active run. Latched from session.failed /
+  // session.finished events so the UI never downgrades from "failed" to
+  // "done" if both events fire (the server emits session.finished after
+  // session.failed during a finalize). Cleared on `attachToRun`.
+  runFinalStatus: null,
 };
 
 // ----------------------------------------------------------------- DOM refs
@@ -342,6 +347,7 @@ ui.btnClear.addEventListener("click", () => {
 function attachToRun(runId, opts) {
   const live = !!(opts && opts.live);
   state.activeRunId = runId;
+  state.runFinalStatus = null;  // clear the terminal-state latch for the new run
   ui.runIdChip.hidden = false;
   ui.runIdChip.textContent = runId;
   ui.btnClear.click();
@@ -392,6 +398,27 @@ function setWsState(text, kind) {
   ui.wsState.className = `chip ${kind || ""}`;
 }
 
+function finalizeRun(status) {
+  // Close the per-run WebSocket and reflect the terminal status in the
+  // header chip + the recent-runs list. Called from `session.finished`
+  // and `session.failed` handlers so the UI updates immediately, without
+  // waiting for the user to start a new run.
+  //
+  // Latches: once we've recorded a `failed` terminal state we don't let a
+  // subsequent `finished` event downgrade it to `done`. (The server's
+  // `_drive` task wraps `run_session` in a try/except that emits
+  // `session.failed`, then unconditionally `session.finalize()` which
+  // emits `session.finished`. Both can arrive on the same run.)
+  if (state.runFinalStatus === "failed" && status !== "failed") return;
+  state.runFinalStatus = status;
+  if (state.ws) {
+    try { state.ws.close(); } catch (_) { /* swallow */ }
+    state.ws = null;
+  }
+  setWsState(`ws: ${status}`, status === "failed" ? "err" : "dim");
+  refreshRuns().catch(() => {});
+}
+
 // ----------------------------------------------------------------- timeline
 
 function appendCard(kindClass, kindLabel, body, ts) {
@@ -418,17 +445,21 @@ const HANDLERS = {
       `workload=${ev.payload.workload_id} backend=${ev.payload.backend_id} ` +
       `device=${ev.payload?.device?.arch || "?"} max_candidates=${ev.payload.max_candidates}`,
       ev.timestamp);
+    setWsState("ws: live", "live");
+    refreshRuns().catch(() => {});
   },
   "session.finished": (ev) => {
     appendCard("session", "session.finished",
       `successful=${ev.payload?.successful_count} failed=${ev.payload?.failed_attempts} ` +
       `episode=${ev.payload?.episode_path || "—"}`,
       ev.timestamp);
+    finalizeRun("done");
   },
   "session.failed": (ev) => {
     appendCard("fail", "session.failed",
       `${ev.payload?.error_type || "Error"}: ${ev.payload?.error_message || ev.payload?.message || "(no detail)"}`,
       ev.timestamp);
+    finalizeRun("failed");
   },
 
   "compile.started": (ev) => {

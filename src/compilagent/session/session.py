@@ -63,6 +63,7 @@ from compilagent.storage.experiment_log import ExperimentLog
 from compilagent.storage.workspace import OptimizationWorkspace
 from compilagent.toolset import Toolset
 
+from .inputs import InterventionInput, PlanInput
 from .leaderboard import best_validated_candidate, build_leaderboard
 from .tools import build_session_toolset
 
@@ -293,16 +294,30 @@ class OptimizationSession:
     def _new_candidate_id(self) -> str:
         return f"cand-{uuid.uuid4().hex[:10]}"
 
-    def _intervention_from_dict(self, entry: Mapping[str, Any], *, where: str) -> Intervention:
-        if not isinstance(entry, Mapping):
-            raise ValueError(f"{where} must be an object")
-        kind = entry.get("target_kind")
+    def _intervention_from_input(self, entry: Any, *, where: str) -> Intervention:
+        """Accept either a typed `InterventionInput` Pydantic model (the
+        normal path under pydantic-ai's typed validation) or a plain dict
+        (kept for the dict-based MCP adapter and any direct callers)."""
+
+        if isinstance(entry, Mapping):
+            kind = entry.get("target_kind")
+            if not kind:
+                raise ValueError(f"{where} is missing `target_kind`")
+            return Intervention(
+                target=Target(kind=str(kind), selector=str(entry.get("target_selector", ""))),
+                payload=entry.get("payload"),
+                rationale=str(entry.get("rationale") or ""),
+            )
+        kind = getattr(entry, "target_kind", None)
         if not kind:
             raise ValueError(f"{where} is missing `target_kind`")
         return Intervention(
-            target=Target(kind=str(kind), selector=str(entry.get("target_selector", ""))),
-            payload=entry.get("payload"),
-            rationale=str(entry.get("rationale") or ""),
+            target=Target(
+                kind=str(kind),
+                selector=str(getattr(entry, "target_selector", "") or ""),
+            ),
+            payload=getattr(entry, "payload", None),
+            rationale=str(getattr(entry, "rationale", "") or ""),
         )
 
     def _validate_plan(self, ivs: Sequence[Intervention]) -> None:
@@ -406,52 +421,68 @@ class OptimizationSession:
     def propose_candidate(
         self,
         *,
-        interventions_json: str,
+        interventions: list[InterventionInput],
         description: str,
         expected_effect: str = "",
     ) -> str:
-        """Register a multi-intervention candidate."""
+        """Register a multi-intervention candidate.
 
-        try:
-            entries = _loads_lenient(interventions_json)
-        except ValueError as exc:
-            raise ValueError(f"interventions_json is not valid JSON: {exc}") from exc
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("interventions_json must be a non-empty JSON list")
+        `interventions` is a typed list — one entry per compile decision in
+        this candidate. Backends may reject any intervention shape they
+        don't accept (`Backend.validate_intervention`); on rejection the
+        whole candidate is rolled back.
+        """
+
+        if not interventions:
+            raise ValueError("interventions must be a non-empty list")
         ivs = [
-            self._intervention_from_dict(entry, where=f"intervention #{i}")
-            for i, entry in enumerate(entries)
+            self._intervention_from_input(entry, where=f"intervention #{i}")
+            for i, entry in enumerate(interventions)
         ]
         registered = self._register_candidate(
             ivs, description=description, expected_effect=expected_effect
         )
         return json.dumps(registered, indent=2)
 
-    def propose_candidates(self, *, plans_json: str) -> str:
-        """Register several candidates at once."""
+    def propose_candidates(self, *, plans: list[PlanInput]) -> str:
+        """Register several candidates at once.
 
-        try:
-            entries = _loads_lenient(plans_json)
-        except ValueError as exc:
-            raise ValueError(f"plans_json is not valid JSON: {exc}") from exc
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("plans_json must be a non-empty JSON list of plan dicts")
+        `plans` is a typed list of candidate plans. Each plan describes one
+        candidate compile (a description, an optional expected_effect, and
+        a list of interventions). The agent emits proper structured JSON
+        arrays — no nested string-encoded JSON.
+        """
+
+        if not plans:
+            raise ValueError("plans must be a non-empty list")
         registered: list[dict[str, Any]] = []
-        for i, plan_dict in enumerate(entries):
-            if not isinstance(plan_dict, Mapping):
-                raise ValueError(f"plan #{i} must be an object")
-            ivs_raw = plan_dict.get("interventions") or []
-            if not isinstance(ivs_raw, list) or not ivs_raw:
-                raise ValueError(f"plan #{i} is missing a non-empty `interventions` list")
+        for i, plan in enumerate(plans):
+            ivs_raw = (
+                plan.get("interventions")
+                if isinstance(plan, Mapping)
+                else getattr(plan, "interventions", None)
+            )
+            if not ivs_raw:
+                raise ValueError(f"plan #{i} must contain a non-empty `interventions` list")
             ivs = [
-                self._intervention_from_dict(iv, where=f"plan #{i} intervention #{j}")
+                self._intervention_from_input(iv, where=f"plan #{i} intervention #{j}")
                 for j, iv in enumerate(ivs_raw)
             ]
+            description = (
+                plan.get("description")
+                if isinstance(plan, Mapping)
+                else getattr(plan, "description", "")
+            )
+            expected_effect = (
+                plan.get("expected_effect", "")
+                if isinstance(plan, Mapping)
+                else getattr(plan, "expected_effect", "")
+            )
             registered.append(
                 self._register_candidate(
                     ivs,
-                    description=str(plan_dict.get("description", "")),
-                    expected_effect=str(plan_dict.get("expected_effect", "")),
+                    description=str(description or ""),
+                    expected_effect=str(expected_effect or ""),
                 )
             )
         return json.dumps(
@@ -692,17 +723,13 @@ class OptimizationSession:
             default=str,
         )
 
-    def run_candidates(self, *, candidate_ids_json: str) -> str:
+    def run_candidates(self, *, candidate_ids: list[str]) -> str:
         """Run a batch of previously proposed candidates in sequence."""
 
-        try:
-            ids = _loads_lenient(candidate_ids_json)
-        except ValueError as exc:
-            raise ValueError(f"candidate_ids_json is not valid JSON: {exc}") from exc
-        if not isinstance(ids, list) or not ids:
-            raise ValueError("candidate_ids_json must be a non-empty list")
+        if not candidate_ids:
+            raise ValueError("candidate_ids must be a non-empty list")
         results: list[dict[str, Any]] = []
-        for cid in ids:
+        for cid in candidate_ids:
             try:
                 results.append(json.loads(self.run_candidate(candidate_id=str(cid))))
             except ValueError:

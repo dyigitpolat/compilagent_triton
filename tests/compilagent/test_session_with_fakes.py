@@ -186,7 +186,10 @@ class _FakeHarness:
                 tool_args=args,
             )
             try:
-                result = toolset.by_name(name).handler(args)
+                # `decl.invoke` validates the wire-shaped dict against the
+                # tool's auto-derived Pydantic args model and dispatches
+                # into the typed handler with kwargs.
+                result = toolset.by_name(name).invoke(args)
                 yield StreamEvent(
                     kind=StreamEventKind.TOOL_RESULT,
                     tool_name=name,
@@ -212,18 +215,17 @@ class _FakeHarness:
         async for ev in _yield_call("inspect_search_space", {}, "c2"):
             yield ev
 
-        # propose a single-intervention candidate on the fake lever
+        # propose a single-intervention candidate on the fake lever — note
+        # the structured array, no string-encoded JSON.
         propose_args = {
-            "interventions_json": json.dumps(
-                [
-                    {
-                        "target_kind": "knob",
-                        "target_selector": "optimize",
-                        "payload": "on",
-                        "rationale": "try the fake flag",
-                    }
-                ]
-            ),
+            "interventions": [
+                {
+                    "target_kind": "knob",
+                    "target_selector": "optimize",
+                    "payload": "on",
+                    "rationale": "try the fake flag",
+                }
+            ],
             "description": "enable optimize flag",
             "expected_effect": "should make it faster",
         }
@@ -348,13 +350,42 @@ def test_proposing_candidate_with_invalid_intervention_raises(
         max_candidates=2,
     )
 
-    bad = json.dumps(
-        [{"target_kind": "made_up_kind", "target_selector": "x", "payload": 1}]
-    )
+    from compilagent.session.inputs import InterventionInput
+
+    bad = [
+        InterventionInput(target_kind="made_up_kind", target_selector="x", payload=1)
+    ]
     with pytest.raises(ValueError):
         session.propose_candidate(
-            interventions_json=bad,
+            interventions=bad,
             description="should be rejected",
+        )
+
+
+def test_typed_args_validation_rejects_missing_target_kind(
+    tmp_path: Path, _registered_workload
+):
+    """The auto-derived Pydantic args model rejects malformed wire dicts at
+    `decl.invoke` time before the handler ever sees them — this is what
+    keeps the agent's tool calls type-safe end-to-end."""
+
+    backend_registry.register("fake", _FakeBackend)
+    workspace = OptimizationWorkspace(session_cwd=tmp_path)
+    session = OptimizationSession(
+        workload_id="fake_workload",
+        run_id="run-typed",
+        workspace=workspace,
+        sink=CapturingSink(),
+        max_candidates=1,
+    )
+    decl = session.toolset.by_name("propose_candidate")
+    # `target_kind` is required by `InterventionInput`.
+    with pytest.raises(ValueError):
+        decl.invoke(
+            {
+                "interventions": [{"target_selector": "x", "payload": 1}],
+                "description": "bad",
+            }
         )
 
 
@@ -369,33 +400,29 @@ def test_run_candidates_aggregates_results(tmp_path: Path, _registered_workload)
         max_candidates=4,
     )
 
-    plans = json.dumps(
-        [
-            {
-                "description": "p1",
-                "interventions": [
-                    {
-                        "target_kind": "knob",
-                        "target_selector": "optimize",
-                        "payload": "on",
-                    }
-                ],
-            },
-            {
-                "description": "p2",
-                "interventions": [
-                    {
-                        "target_kind": "knob",
-                        "target_selector": "optimize",
-                        "payload": "off",
-                    }
-                ],
-            },
-        ]
-    )
-    registered = json.loads(session.propose_candidates(plans_json=plans))
+    from compilagent.session.inputs import InterventionInput, PlanInput
+
+    plans = [
+        PlanInput(
+            description="p1",
+            interventions=[
+                InterventionInput(
+                    target_kind="knob", target_selector="optimize", payload="on"
+                )
+            ],
+        ),
+        PlanInput(
+            description="p2",
+            interventions=[
+                InterventionInput(
+                    target_kind="knob", target_selector="optimize", payload="off"
+                )
+            ],
+        ),
+    ]
+    registered = json.loads(session.propose_candidates(plans=plans))
     ids = [c["id"] for c in registered["candidates"]]
-    summary = json.loads(session.run_candidates(candidate_ids_json=json.dumps(ids)))
+    summary = json.loads(session.run_candidates(candidate_ids=ids))
     assert summary["ran"] == 2
     assert summary["successful"] == 2
     assert summary["best"] is not None
