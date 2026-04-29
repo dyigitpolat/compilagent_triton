@@ -17,9 +17,12 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from compilagent.toolset import Toolset
+
+if TYPE_CHECKING:
+    from compilagent.session.completion import RunSnapshot
 
 
 class StreamEventKind(StrEnum):
@@ -126,5 +129,27 @@ class Harness(Protocol):
           - Configuration: `request.extra` carries harness-specific knobs
             (max_budget_usd, permission_mode, retries, …); the harness
             consumes only what it recognises.
+        """
+        ...
+
+    def build_continuation_request(
+        self,
+        previous: HarnessRunRequest,
+        snapshot: RunSnapshot,
+    ) -> HarnessRunRequest:
+        """Produce the next request to feed back into `run(...)` after the
+        orchestrator decides the run isn't complete.
+
+        The harness MAY use any prompt-construction strategy — typically it
+        composes a state-aware continuation user prompt that names missing
+        reflection tools, remaining slots, current best, etc. It returns a
+        full `HarnessRunRequest` so it can also adjust its own knobs
+        (`extra`, `max_turns`, `reasoning_effort`) per iteration if useful.
+
+        The default-tree harnesses keep `previous.system_instructions`,
+        `model_id`, `toolset`, and most settings; they only swap
+        `user_prompt`. Prompt text MUST live inside the harness module so
+        each integration owns its own prompting style — the session never
+        builds prompt strings.
         """
         ...

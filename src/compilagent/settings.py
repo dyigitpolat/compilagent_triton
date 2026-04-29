@@ -73,6 +73,7 @@ class CompilagentSettings(BaseModel):
     max_tokens: int = 8192
     temperature: float = 0.2
     max_candidates: int = 4
+    max_continuations: int = 4
     max_benchmark_seconds: int = 120
     noise_threshold_pct: float = 2.0
     workspace_dir_name: str = DEFAULT_WORKSPACE_DIR_NAME
@@ -87,6 +88,13 @@ class CompilagentSettings(BaseModel):
     def _positive_int(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("value must be positive")
+        return value
+
+    @field_validator("max_continuations")
+    @classmethod
+    def _non_negative_int(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("max_continuations must be non-negative")
         return value
 
     @field_validator("temperature")
@@ -152,6 +160,9 @@ class CompilagentSettings(BaseModel):
             "max_tokens": _env_int("COMPILAGENT_MAX_TOKENS", dotenv, 8192),
             "temperature": _env_float("COMPILAGENT_TEMPERATURE", dotenv, 0.2),
             "max_candidates": _env_int("COMPILAGENT_MAX_CANDIDATES", dotenv, 4),
+            "max_continuations": _env_int(
+                "COMPILAGENT_MAX_CONTINUATIONS", dotenv, 4
+            ),
             "max_benchmark_seconds": _env_int(
                 "COMPILAGENT_MAX_BENCHMARK_SECONDS", dotenv, 120
             ),
@@ -176,6 +187,7 @@ class CompilagentSettings(BaseModel):
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "max_candidates": self.max_candidates,
+            "max_continuations": self.max_continuations,
             "max_benchmark_seconds": self.max_benchmark_seconds,
             "noise_threshold_pct": self.noise_threshold_pct,
             "workspace_dir_name": self.workspace_dir_name,

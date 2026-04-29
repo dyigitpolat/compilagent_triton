@@ -63,6 +63,12 @@ from compilagent.storage.experiment_log import ExperimentLog
 from compilagent.storage.workspace import OptimizationWorkspace
 from compilagent.toolset import Toolset
 
+from .completion import (
+    CompletionDecision,
+    DefaultCompletionPolicy,
+    RunCompletionPolicy,
+    RunSnapshot,
+)
 from .inputs import InterventionInput, PlanInput
 from .leaderboard import best_validated_candidate, build_leaderboard
 from .tools import build_session_toolset
@@ -909,36 +915,148 @@ class OptimizationSession:
 # ============================================================================
 
 
+class _StreamObserver:
+    """Per-iteration tap on the harness `StreamEvent` stream.
+
+    The session driver already translates events into `ObservationEvent`s
+    via `_translate_stream_event`; this observer captures the secondary
+    signal the orchestrator needs (which tools fired, how the iteration
+    ended) without coupling the completion policy to event translation.
+    """
+
+    __slots__ = (
+        "tools_called",
+        "final_text",
+        "metadata",
+        "failed",
+        "error_type",
+        "error_message",
+    )
+
+    def __init__(self) -> None:
+        self.tools_called: set[str] = set()
+        self.final_text: str | None = None
+        self.metadata: dict[str, Any] = {}
+        self.failed = False
+        self.error_type: str | None = None
+        self.error_message: str | None = None
+
+    def observe(self, event: StreamEvent) -> None:
+        if event.kind is StreamEventKind.TOOL_CALL and event.tool_name:
+            self.tools_called.add(event.tool_name)
+        elif event.kind is StreamEventKind.RUN_FINISHED:
+            self.final_text = event.text
+            self.metadata = dict(event.extra or {})
+        elif event.kind is StreamEventKind.RUN_FAILED:
+            self.failed = True
+            self.metadata = dict(event.extra or {})
+            self.error_type = event.error_type
+            self.error_message = event.error_message
+
+
+def _best_speedup(session: OptimizationSession) -> float | None:
+    """Return the highest validated speedup across registered candidates.
+
+    Pulled from `session.candidates` directly (each entry stores a
+    `speedup` field after `run_candidate`); avoids re-running the
+    leaderboard sort just to read the top number.
+    """
+
+    best: float | None = None
+    for c in session.candidates.values():
+        sp = c.get("speedup")
+        if sp is None:
+            continue
+        correctness = c.get("correctness")
+        if correctness is not None and not getattr(correctness, "ok", True):
+            continue
+        if best is None or sp > best:
+            best = float(sp)
+    return best
+
+
 async def run_session(
     *,
     session: OptimizationSession,
     harness: Harness,
     request: HarnessRunRequest,
+    max_continuations: int = 4,
+    completion_policy: RunCompletionPolicy | None = None,
 ) -> HarnessResult:
-    """Drive `session` against `harness` and translate the stream into events.
+    """Drive `session` against `harness` with a continuation loop.
 
-    Tool calls are dispatched by the harness; this driver only mirrors the
-    `StreamEvent` stream into the session's `ObservationSink`.
+    Each iteration runs the harness once, translates its `StreamEvent`s
+    into `ObservationEvent`s, and consults `completion_policy`. When the
+    policy says the run isn't done — typically because `max_candidates`
+    hasn't been hit or the reflection tools haven't fired — the harness
+    is asked for a continuation request via
+    `harness.build_continuation_request(previous, snapshot)` and re-run.
+
+    All prompt construction happens inside the harness; this orchestrator
+    only carries the snapshot.
     """
 
+    policy = completion_policy or DefaultCompletionPolicy()
+    tools_called: set[str] = set()
     started = time.perf_counter()
     final_text: str | None = None
     metadata: dict[str, Any] = {}
     failed = False
     error_type: str | None = None
     error_message: str | None = None
+    decision = CompletionDecision(False, "continue")
+    current_request = request
 
-    iterator: AsyncIterator[StreamEvent] = harness.run(request)
-    async for event in iterator:
-        _translate_stream_event(session, event)
-        if event.kind is StreamEventKind.RUN_FINISHED:
-            final_text = event.text
-            metadata = dict(event.extra or {})
-        elif event.kind is StreamEventKind.RUN_FAILED:
+    for iteration in range(max_continuations + 1):
+        observer = _StreamObserver()
+        iterator: AsyncIterator[StreamEvent] = harness.run(current_request)
+        async for event in iterator:
+            _translate_stream_event(session, event)
+            observer.observe(event)
+        tools_called |= observer.tools_called
+        if observer.final_text is not None:
+            final_text = observer.final_text
+        if observer.metadata:
+            metadata = observer.metadata
+        if observer.failed:
             failed = True
-            metadata = dict(event.extra or {})
-            error_type = event.error_type
-            error_message = event.error_message
+            error_type = observer.error_type
+            error_message = observer.error_message
+
+        snap = RunSnapshot(
+            successful_count=session.budget_state["successful_count"],
+            failed_attempts=session.budget_state["failed_attempts"],
+            max_candidates=session.max_candidates,
+            max_failed_attempts=session.budget_state["max_failed_attempts"],
+            tools_called=frozenset(tools_called),
+            iteration=iteration,
+            max_continuations=max_continuations,
+            harness_failed=observer.failed,
+            best_speedup=_best_speedup(session),
+        )
+        decision = policy.evaluate(snap)
+        if decision.done:
+            break
+
+        # Delegate continuation prompt construction to the harness — the
+        # session never builds prompt text. Each harness owns its own
+        # continuation prompt template.
+        current_request = harness.build_continuation_request(current_request, snap)
+        slots_remaining = max(
+            0, snap.max_candidates - snap.successful_count
+        )
+        session.sink.emit_kv(
+            EventKind.RUN_CONTINUATION,
+            payload={
+                "iteration": iteration + 1,
+                "successful_count": snap.successful_count,
+                "failed_attempts": snap.failed_attempts,
+                "slots_remaining": slots_remaining,
+                "tools_called": sorted(tools_called),
+                "reason_to_continue": decision.reason,
+            },
+            run_id=session.run_id,
+        )
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if failed:
@@ -957,7 +1075,12 @@ async def run_session(
             payload=payload,
             run_id=session.run_id,
         )
-    return HarnessResult(final_text=final_text, elapsed_ms=elapsed_ms, metadata=metadata)
+    final_metadata = dict(metadata)
+    final_metadata.setdefault("completion_reason", decision.reason)
+    final_metadata.setdefault("iterations", min(iteration + 1, max_continuations + 1))
+    return HarnessResult(
+        final_text=final_text, elapsed_ms=elapsed_ms, metadata=final_metadata
+    )
 
 
 def _translate_stream_event(session: OptimizationSession, event: StreamEvent) -> None:

@@ -128,6 +128,7 @@ def _run_session(
     model_id: str,
     max_candidates: int,
     user_prompt: str,
+    max_continuations: int,
 ) -> OptimizationResult:
     started = time.perf_counter()
     workspace.ensure()
@@ -152,7 +153,12 @@ def _run_session(
     )
     harness = harness_registry.get(harness_id)
     harness_result = asyncio.run(
-        run_session(session=session, harness=harness, request=request)
+        run_session(
+            session=session,
+            harness=harness,
+            request=request,
+            max_continuations=max_continuations,
+        )
     )
 
     leaderboard = _read_leaderboard_json(session)
@@ -194,6 +200,7 @@ def optimize_module(
     example_inputs: tuple[Any, ...],
     *,
     max_candidates: int = 8,
+    max_continuations: int | None = None,
     backend_id: str = "torch_inductor",
     harness: str | None = None,
     model_id: str | None = None,
@@ -249,6 +256,11 @@ def optimize_module(
         model_id=(model_id or settings.model_name),
         max_candidates=max_candidates,
         user_prompt=user_prompt,
+        max_continuations=(
+            settings.max_continuations
+            if max_continuations is None
+            else max_continuations
+        ),
     )
 
 
@@ -259,6 +271,7 @@ def optimize_kernel(
     grid: Callable[[dict[str, Any]], tuple[int, ...]],
     constexpr: dict[str, Any] | None = None,
     max_candidates: int = 8,
+    max_continuations: int | None = None,
     backend_id: str = "triton",
     harness: str | None = None,
     model_id: str | None = None,
@@ -319,6 +332,11 @@ def optimize_kernel(
         model_id=(model_id or settings.model_name),
         max_candidates=max_candidates,
         user_prompt=user_prompt,
+        max_continuations=(
+            settings.max_continuations
+            if max_continuations is None
+            else max_continuations
+        ),
     )
 
 

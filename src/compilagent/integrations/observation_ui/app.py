@@ -336,6 +336,9 @@ def create_app(
         if harness_id not in harness_registry.ids():
             raise HTTPException(404, f"harness `{harness_id}` is not registered")
         max_candidates = int(payload.get("max_candidates", settings.max_candidates))
+        max_continuations = int(
+            payload.get("max_continuations", settings.max_continuations)
+        )
         run_id = f"ui-{uuid.uuid4().hex[:10]}"
         model_id = str(payload.get("model_id") or settings.model_name)
         user_prompt = str(
@@ -367,7 +370,12 @@ def create_app(
             )
             harness = harness_registry.get(harness_id)
             try:
-                await run_session(session=session, harness=harness, request=request)
+                await run_session(
+                    session=session,
+                    harness=harness,
+                    request=request,
+                    max_continuations=max_continuations,
+                )
             except Exception as exc:  # noqa: BLE001
                 trace_store.emit_kv(
                     "session.failed",

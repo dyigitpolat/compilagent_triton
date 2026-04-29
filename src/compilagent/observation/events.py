@@ -42,6 +42,7 @@ class EventKind(StrEnum):
     CANDIDATE_REJECTED = "candidate.rejected"
 
     RUN_PROGRESS = "run.progress"
+    RUN_CONTINUATION = "run.continuation"
     LEADERBOARD_UPDATED = "leaderboard.updated"
 
     AGENT_THINKING_STARTED = "agent.thinking.started"

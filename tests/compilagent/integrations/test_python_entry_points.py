@@ -86,6 +86,14 @@ class _NoOpHarness:
     id: str = "nop"
     supported_providers: tuple[str, ...] = ("fake",)
 
+    def build_continuation_request(self, previous, snapshot):  # noqa: ANN001
+        # The harness yields RUN_FINISHED with no candidates produced, so
+        # `successful_count` stays 0 < max_candidates and the orchestrator
+        # would try to continue. Returning the same request is fine for the
+        # test — we just want to exercise the dispatch happy path. The
+        # orchestrator caps re-runs at `max_continuations` regardless.
+        return previous
+
     async def run(self, request: HarnessRunRequest) -> AsyncIterator[StreamEvent]:
         yield StreamEvent(kind=StreamEventKind.RUN_FINISHED, text="ok")
 
@@ -106,6 +114,7 @@ def test_optimize_module_dispatches_through_registries(tmp_path):
         model_name="test",
         harness="nop",
         max_candidates=2,
+        max_continuations=0,
         max_benchmark_seconds=1,
     )
     workspace = OptimizationWorkspace(session_cwd=tmp_path)

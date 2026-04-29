@@ -75,6 +75,7 @@ def agent_factory_from_session(session_ctx: Any) -> Any:
         workload_id: str,
         max_candidates: int = 4,
         user_prompt: str = "",
+        max_continuations: int | None = None,
     ) -> str:
         """Run an optimization session for `workload_id` and return the leaderboard."""
 
@@ -114,7 +115,16 @@ def agent_factory_from_session(session_ctx: Any) -> Any:
             },
         )
         harness = harness_registry.get(harness_id)
-        await run_session(session=session, harness=harness, request=request)
+        await run_session(
+            session=session,
+            harness=harness,
+            request=request,
+            max_continuations=(
+                settings.max_continuations
+                if max_continuations is None
+                else max_continuations
+            ),
+        )
         session.finalize()
         try:
             rows = json.loads(session.compare_runs())

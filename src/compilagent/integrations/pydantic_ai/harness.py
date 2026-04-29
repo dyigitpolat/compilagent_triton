@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from typing import Any
 
 from compilagent.harness.base import (
@@ -26,10 +27,12 @@ from compilagent.harness.base import (
     StreamEvent,
     StreamEventKind,
 )
+from compilagent.session.completion import RunSnapshot
 
 from ._model import resolve_model, resolve_model_settings
 from ._tool_adapter import make_pydantic_ai_tool_fn
 from ._translate import translate_model_event, translate_tool_event
+from .prompts import continuation_user_prompt
 
 
 def _retry_on_value_error(fn):
@@ -89,6 +92,19 @@ class PydanticAIHarness:
 
         async for event in _drive_agent(agent, request, model_settings):
             yield event
+
+    def build_continuation_request(
+        self,
+        previous: HarnessRunRequest,
+        snapshot: RunSnapshot,
+    ) -> HarnessRunRequest:
+        """Re-prime the same agent surface with a state-aware user prompt.
+
+        Toolset, system instructions, model id, and harness settings are
+        carried over verbatim; only `user_prompt` changes.
+        """
+
+        return replace(previous, user_prompt=continuation_user_prompt(snapshot))
 
 
 async def _drive_agent(

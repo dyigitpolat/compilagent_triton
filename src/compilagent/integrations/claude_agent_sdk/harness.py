@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 from compilagent.harness.base import (
@@ -28,10 +29,12 @@ from compilagent.harness.base import (
     StreamEvent,
     StreamEventKind,
 )
+from compilagent.session.completion import RunSnapshot
 from compilagent.toolset import Toolset
 
 from ._mcp import allowed_tools_for, create_optimizer_mcp_server
 from ._translate import translate_sdk_message
+from .prompts import continuation_user_prompt
 
 _MCP_SERVER_NAME = "compilagent"
 
@@ -107,6 +110,15 @@ class ClaudeAgentSdkHarness:
                 "session_id": session_id,
             },
         )
+
+    def build_continuation_request(
+        self,
+        previous: HarnessRunRequest,
+        snapshot: RunSnapshot,
+    ) -> HarnessRunRequest:
+        """Re-prime the SDK with a state-aware Markdown user prompt."""
+
+        return replace(previous, user_prompt=continuation_user_prompt(snapshot))
 
     def _build_options(
         self,

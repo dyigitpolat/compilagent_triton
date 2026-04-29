@@ -175,6 +175,15 @@ class _FakeHarness:
     id: str = "fake_harness"
     supported_providers: tuple[str, ...] = ("fake",)
 
+    def build_continuation_request(self, previous, snapshot):  # noqa: ANN001
+        # The fake completes the budget on iteration 0; any continuation
+        # request is a regression in the orchestrator.
+        raise AssertionError(
+            f"build_continuation_request unexpectedly called "
+            f"(iteration={snapshot.iteration}, "
+            f"successful_count={snapshot.successful_count})"
+        )
+
     async def run(self, request: HarnessRunRequest) -> AsyncIterator[StreamEvent]:
         toolset = request.toolset
 
@@ -287,7 +296,7 @@ def test_session_with_fakes_drives_one_run(tmp_path: Path, _registered_workload)
         run_id="run-test",
         workspace=workspace,
         sink=sink,
-        max_candidates=4,
+        max_candidates=1,
     )
 
     # Bootstrap should have emitted these in order:
@@ -453,6 +462,12 @@ def test_run_session_surfaces_harness_error_in_session_failed_payload(
         id: str = "fail"
         supported_providers: tuple[str, ...] = ("fake",)
 
+        def build_continuation_request(self, previous, snapshot):  # noqa: ANN001
+            raise AssertionError(
+                "build_continuation_request must not be called when harness "
+                "yielded RUN_FAILED"
+            )
+
         async def run(self, request):
             yield StreamEvent(
                 kind=StreamEventKind.RUN_FAILED,
@@ -473,3 +488,7 @@ def test_run_session_surfaces_harness_error_in_session_failed_payload(
     assert failure.payload["error_type"] == "ModelHTTPError"
     assert "output_config.effort" in failure.payload["error_message"]
     assert failure.payload["status_code"] == 400
+    # No continuation attempted when the harness yielded RUN_FAILED.
+    assert not any(
+        e.kind == EventKind.RUN_CONTINUATION.value for e in sink.events
+    )
