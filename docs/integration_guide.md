@@ -139,6 +139,14 @@ from compilagent import (
 class MyHarness:
     id = "my_harness"
     supported_providers = ("anthropic", "openai")
+    # Known-good model strings. The observation UI populates the model
+    # dropdown from this tuple when the user picks the harness, so they
+    # never have to memorise provider-specific model ids. Empty tuple is
+    # allowed (no opinion).
+    example_models = (
+        "anthropic:claude-opus-4-7",
+        "openai:gpt-4o",
+    )
 
     async def run(self, request: HarnessRunRequest) -> AsyncIterator[StreamEvent]:
         # 1. Translate request.toolset into your runtime's native tools.
@@ -162,6 +170,16 @@ class MyHarness:
 - **Read-only / destructive gating.** Respect `ToolDecl.read_only` if your
   runtime exposes permission modes (ACP prepare-tool, Claude SDK
   `allowed_tools`).
+- **Advertise tested model ids via `example_models`.** Mirrors how
+  backends ship example workloads: a small tuple of `provider:model`
+  strings the harness has actually been tested against. The observation
+  UI surfaces them in the model dropdown so the user never has to guess
+  whether a model accepts the runtime knobs the harness sends (e.g.
+  pydantic-ai's `anthropic_effort` works on Opus / Sonnet but not
+  Haiku, so PydanticAIHarness advertises only the supported set; the
+  Claude Agent SDK harness manages thinking config itself, so it
+  advertises both Opus and Haiku). End users can still type any
+  custom id — `example_models` is suggestion, not constraint.
 
 ## Slot 3: `Workload` — a new compile target
 

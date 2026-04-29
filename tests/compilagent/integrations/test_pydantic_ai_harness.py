@@ -267,6 +267,20 @@ def test_resolve_model_settings_non_anthropic_uses_caller_temperature():
     assert out["temperature"] == 0.7
 
 
+def test_pydantic_ai_harness_advertises_example_models():
+    """Each harness ships a tuple of known-good model strings the UI uses
+    to populate the model dropdown — mirroring how backends ship example
+    workloads. Picking a model that's compatible with the chosen harness
+    is the user's responsibility; surfacing tested values keeps that
+    responsibility cheap."""
+
+    from compilagent.integrations.pydantic_ai import PydanticAIHarness
+
+    h = PydanticAIHarness()
+    assert "anthropic:claude-opus-4-7" in h.example_models
+    assert "mistral:mistral-large-latest" in h.example_models
+
+
 # --------------------------------------------------------- end-to-end
 
 

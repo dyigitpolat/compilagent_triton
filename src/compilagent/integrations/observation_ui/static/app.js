@@ -64,7 +64,7 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   selWorkload: $("sel-workload"),
   selHarness: $("sel-harness"),
-  inpModel: $("inp-model"),
+  selModel: $("sel-model"),
   inpCandidates: $("inp-candidates"),
   btnStart: $("btn-start"),
   runForm: $("run-form"),
@@ -247,11 +247,54 @@ function populateSelectors() {
   }
 
   if (state.runtime) {
-    ui.inpModel.value = state.runtime.model_name || "";
     ui.inpCandidates.value = state.runtime.max_candidates || 4;
     if (state.runtime.harness && state.harnesses.find(h => h.id === state.runtime.harness)) {
       ui.selHarness.value = state.runtime.harness;
     }
+  }
+
+  // Populate the model dropdown with the active harness's `example_models`,
+  // mirroring how backends ship example workloads. The settings default
+  // (`COMPILAGENT_MODEL`) is included as an option whenever it isn't
+  // already in the harness's suggestions, so a custom env-driven default
+  // is never silently dropped.
+  refreshModelOptions();
+}
+
+function refreshModelOptions() {
+  const activeId = ui.selHarness.value;
+  const harness = state.harnesses.find(h => h.id === activeId);
+  const suggestions = (harness && harness.example_models) || [];
+  const defaultModel = (state.runtime && state.runtime.model_name) || "";
+
+  // Build the option list: harness suggestions first, settings default
+  // appended only when it's not already there. De-dup while preserving
+  // order.
+  const seen = new Set();
+  const options = [];
+  for (const m of suggestions) {
+    if (!seen.has(m)) { seen.add(m); options.push(m); }
+  }
+  if (defaultModel && !seen.has(defaultModel)) {
+    options.push(defaultModel);
+  }
+
+  // If the current value matches one of the new options, keep it;
+  // otherwise prefer the settings default, then the first suggestion.
+  const previous = ui.selModel.value;
+  ui.selModel.innerHTML = "";
+  for (const m of options) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
+    ui.selModel.appendChild(opt);
+  }
+  if (options.includes(previous)) {
+    ui.selModel.value = previous;
+  } else if (options.includes(defaultModel)) {
+    ui.selModel.value = defaultModel;
+  } else if (options.length) {
+    ui.selModel.value = options[0];
   }
 }
 
@@ -309,6 +352,8 @@ function renderRuns() {
   }
 }
 
+ui.selHarness.addEventListener("change", () => refreshModelOptions());
+
 ui.runForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const workloadId = ui.selWorkload.value;
@@ -321,7 +366,7 @@ ui.runForm.addEventListener("submit", async (ev) => {
     const body = {
       workload_id: workloadId,
       harness,
-      model_id: ui.inpModel.value.trim() || undefined,
+      model_id: (ui.selModel.value || "").trim() || undefined,
       max_candidates: parseInt(ui.inpCandidates.value, 10) || 4,
     };
     const result = await api("/api/runs/workload", {

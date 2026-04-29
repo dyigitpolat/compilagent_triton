@@ -54,6 +54,15 @@ class PydanticAIHarness:
 
     id: str = "pydantic_ai"
     supported_providers: tuple[str, ...] = ("anthropic", "mistral", "openai")
+    # Known-good model strings for this harness. Surfaced in the
+    # observation UI's model dropdown when the user picks `pydantic_ai`.
+    # Models that need adaptive thinking should support pydantic-ai's
+    # `anthropic_effort` setting; haiku-class Anthropic models don't
+    # accept `output_config.effort` and are deliberately excluded.
+    example_models: tuple[str, ...] = (
+        "anthropic:claude-opus-4-7",
+        "mistral:mistral-large-latest",
+    )
 
     async def run(self, request: HarnessRunRequest) -> AsyncIterator[StreamEvent]:
         """Drive one agent run; yield `StreamEvent`s until completion."""

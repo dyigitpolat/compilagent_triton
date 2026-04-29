@@ -41,6 +41,13 @@ class ClaudeAgentSdkHarness:
 
     id: str = "claude_agent_sdk"
     supported_providers: tuple[str, ...] = ("anthropic",)
+    # Known-good model strings for this harness. The Claude Agent SDK
+    # routes through the `claude` CLI which accepts both opus and haiku
+    # 4.x cleanly (the SDK manages thinking config for us).
+    example_models: tuple[str, ...] = (
+        "anthropic:claude-opus-4-7",
+        "anthropic:claude-haiku-4-5",
+    )
 
     async def run(self, request: HarnessRunRequest) -> AsyncIterator[StreamEvent]:
         try:

@@ -99,6 +99,14 @@ class Harness(Protocol):
     (e.g. when it routes through a single fixed provider).
     """
 
+    example_models: tuple[str, ...]
+    """Known-good model strings the harness ships as suggestions.
+
+    The observation UI uses this to populate its model dropdown when the
+    user picks a harness, mirroring how backends register example
+    workloads. Empty tuple is allowed for harnesses with no opinion.
+    """
+
     def run(self, request: HarnessRunRequest) -> AsyncIterator[StreamEvent]:
         """Drive one agent run, yielding `StreamEvent`s until the run ends.
 

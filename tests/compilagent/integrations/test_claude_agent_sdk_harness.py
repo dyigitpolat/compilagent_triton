@@ -16,6 +16,18 @@ def test_self_registration():
     assert h.supported_providers == ("anthropic",)
 
 
+def test_claude_agent_sdk_harness_advertises_example_models():
+    """The Claude Agent SDK accepts haiku 4.x cleanly (the SDK manages
+    thinking config for us), so both opus and haiku ship as suggestions
+    for the UI's model dropdown."""
+
+    from compilagent.integrations.claude_agent_sdk import ClaudeAgentSdkHarness
+
+    h = ClaudeAgentSdkHarness()
+    assert "anthropic:claude-opus-4-7" in h.example_models
+    assert "anthropic:claude-haiku-4-5" in h.example_models
+
+
 def test_mcp_server_built_from_toolset_not_reflection():
     """Verify the new design: the MCP server iterates Toolset.tools rather
     than introspecting an OptimizerRuntime."""

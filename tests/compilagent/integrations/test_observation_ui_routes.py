@@ -103,14 +103,32 @@ def test_harnesses_endpoint_returns_registry(tmp_path):
     class _H:
         id = "fake_h"
         supported_providers: tuple[str, ...] = ("provider_a",)
+        example_models: tuple[str, ...] = ("provider_a:demo-model",)
 
     harness_registry.register("fake_h", _H)
     app = _make_app(tmp_path)
     with TestClient(app) as client:
         r = client.get("/api/harnesses")
         assert r.status_code == 200
-        ids = [h["id"] for h in r.json()["harnesses"]]
+        body = r.json()
+        ids = [h["id"] for h in body["harnesses"]]
         assert "fake_h" in ids
+        fake = next(h for h in body["harnesses"] if h["id"] == "fake_h")
+        assert fake["example_models"] == ["provider_a:demo-model"]
+
+
+def test_runtime_config_includes_harness_example_models(tmp_path):
+    class _H:
+        id = "fake_seed"
+        supported_providers: tuple[str, ...] = ("acme",)
+        example_models: tuple[str, ...] = ("acme:big", "acme:small")
+
+    harness_registry.register("fake_seed", _H)
+    app = _make_app(tmp_path)
+    with TestClient(app) as client:
+        body = client.get("/api/runtime/config").json()
+        fake = next(h for h in body["harnesses"] if h["id"] == "fake_seed")
+        assert fake["example_models"] == ["acme:big", "acme:small"]
 
 
 # --------------------------------------------------------- workloads

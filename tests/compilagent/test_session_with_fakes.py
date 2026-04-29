@@ -426,3 +426,50 @@ def test_run_candidates_aggregates_results(tmp_path: Path, _registered_workload)
     assert summary["ran"] == 2
     assert summary["successful"] == 2
     assert summary["best"] is not None
+
+
+def test_run_session_surfaces_harness_error_in_session_failed_payload(
+    tmp_path: Path, _registered_workload
+):
+    """Regression: when a harness yields RUN_FAILED with error_type +
+    error_message, run_session must include them in the SESSION_FAILED
+    payload. Without this, the trace shows only `{"elapsed_ms": ...}`
+    and the user can't see what went wrong (e.g. an Anthropic API
+    rejection in the first 700ms of a haiku run)."""
+
+    backend_registry.register("fake", _FakeBackend)
+    workspace = OptimizationWorkspace(session_cwd=tmp_path)
+    sink = CapturingSink()
+    session = OptimizationSession(
+        workload_id="fake_workload",
+        run_id="run-fail",
+        workspace=workspace,
+        sink=sink,
+        max_candidates=1,
+    )
+
+    @dataclass
+    class _FailingHarness:
+        id: str = "fail"
+        supported_providers: tuple[str, ...] = ("fake",)
+
+        async def run(self, request):
+            yield StreamEvent(
+                kind=StreamEventKind.RUN_FAILED,
+                error_type="ModelHTTPError",
+                error_message="output_config.effort is not supported on this model",
+                extra={"status_code": 400},
+            )
+
+    request = HarnessRunRequest(
+        toolset=session.toolset,
+        system_instructions="x",
+        user_prompt="y",
+        model_id="anthropic:claude-haiku-4-5",
+    )
+    asyncio.run(run_session(session=session, harness=_FailingHarness(), request=request))
+
+    failure = next(e for e in sink.events if e.kind == EventKind.SESSION_FAILED.value)
+    assert failure.payload["error_type"] == "ModelHTTPError"
+    assert "output_config.effort" in failure.payload["error_message"]
+    assert failure.payload["status_code"] == 400

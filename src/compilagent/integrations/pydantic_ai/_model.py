@@ -192,8 +192,12 @@ def resolve_model_settings(
     """Build the `model_settings` dict pydantic-ai consumes.
 
     Translates our `reasoning_effort` to Anthropic's adaptive-thinking
-    `output_config.effort` (exposed as `anthropic_effort`). When effort is
-    set on Anthropic models, temperature must be 1.0 per Anthropic's API.
+    `output_config.effort` (exposed as `anthropic_effort`). When effort
+    is set on Anthropic models, temperature must be 1.0 per Anthropic's
+    API. Picking a model that supports the chosen reasoning_effort is
+    the caller's responsibility — each harness advertises a tuple of
+    known-good model strings via `Harness.example_models`, surfaced in
+    the observation UI's model dropdown.
     """
 
     out: dict[str, Any] = {}

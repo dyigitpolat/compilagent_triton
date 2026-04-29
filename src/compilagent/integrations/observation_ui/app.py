@@ -253,6 +253,9 @@ def create_app(
                         "supported_providers": list(
                             getattr(harness_registry.get(hid), "supported_providers", ())
                         ),
+                        "example_models": list(
+                            getattr(harness_registry.get(hid), "example_models", ())
+                        ),
                     }
                     for hid in harness_registry.ids()
                 ],
@@ -286,6 +289,9 @@ def create_app(
                         "id": hid,
                         "supported_providers": list(
                             getattr(harness_registry.get(hid), "supported_providers", ())
+                        ),
+                        "example_models": list(
+                            getattr(harness_registry.get(hid), "example_models", ())
                         ),
                     }
                     for hid in harness_registry.ids()

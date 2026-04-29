@@ -925,6 +925,8 @@ async def run_session(
     final_text: str | None = None
     metadata: dict[str, Any] = {}
     failed = False
+    error_type: str | None = None
+    error_message: str | None = None
 
     iterator: AsyncIterator[StreamEvent] = harness.run(request)
     async for event in iterator:
@@ -935,12 +937,24 @@ async def run_session(
         elif event.kind is StreamEventKind.RUN_FAILED:
             failed = True
             metadata = dict(event.extra or {})
+            error_type = event.error_type
+            error_message = event.error_message
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if failed:
+        # Surface the harness's error_type / error_message in the failure
+        # event payload — without these the UI shows only "session.failed
+        # in 658ms" with no diagnostic. The trace event is the user's only
+        # window into harness-side failures (model rejected request, API
+        # key invalid, network blip, etc.) so we always populate them.
+        payload: dict[str, Any] = {"elapsed_ms": elapsed_ms, **metadata}
+        if error_type is not None:
+            payload["error_type"] = error_type
+        if error_message is not None:
+            payload["error_message"] = error_message
         session.sink.emit_kv(
             EventKind.SESSION_FAILED,
-            payload={"elapsed_ms": elapsed_ms, **metadata},
+            payload=payload,
             run_id=session.run_id,
         )
     return HarnessResult(final_text=final_text, elapsed_ms=elapsed_ms, metadata=metadata)
