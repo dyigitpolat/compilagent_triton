@@ -1,7 +1,7 @@
 [project]
-name = "compilagent-triton"
-version = "0.1.0"
-description = "Plug-and-play optimization core with agentic Triton + Inductor integrations."
+name = "compilagent"
+version = "0.2.0"
+description = "Plug-and-play optimization core with agentic compiler and harness integrations."
 readme = "README.md"
 requires-python = ">=3.11"
 # The base install only carries what the core (`src/compilagent/`) needs.
@@ -41,23 +41,18 @@ all = [
 ]
 
 # --- developer / experiment extras ---
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "httpx>=0.27"]
 gpu = ["numpy>=2.0", "torch>=2.11", "torchvision>=0.20"]
 
 [project.scripts]
-# Legacy entry points (will be retired with `compilagent_triton/`):
-compilagent-triton = "compilagent_triton.agent:main"
-compilagent-observe-legacy = "compilagent_triton.observation_server:main"
-# Phase-2 entry points
 compilagent-acp = "compilagent.integrations.pydantic_acp.cli:main"
 compilagent-observe = "compilagent.integrations.observation_ui.cli:main"
 
 [project.entry-points."compilagent.integrations"]
-# Phase-2 integrations register themselves under this group.
-# The core's `load_entry_point_integrations()` imports each module name listed
-# here at session bootstrap, which fires the integration's registry side
-# effects. Out-of-tree third parties advertise the same group from their own
-# pyproject.
+# Each integration self-registers when its module is imported. The core's
+# `load_entry_point_integrations()` imports each module name listed here at
+# session bootstrap, which fires the registry side effects. Out-of-tree third
+# parties advertise the same group from their own pyproject.
 triton = "compilagent.integrations.triton"
 torch_inductor = "compilagent.integrations.torch_inductor"
 python = "compilagent.integrations.python"
@@ -71,7 +66,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/compilagent_triton", "src/compilagent"]
+packages = ["src/compilagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -88,7 +83,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
 
-# Lifted compiler internals are evolving alongside the upstream legacy code.
+# Lifted compiler internals are evolving with their upstream libraries.
 # We don't lint them here so the diff stays focused on architecture seams.
 [tool.ruff.lint.per-file-ignores]
 "src/compilagent/integrations/triton/_internal/*.py" = ["B", "C4", "SIM"]
