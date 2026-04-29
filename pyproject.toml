@@ -1,25 +1,67 @@
 [project]
 name = "compilagent-triton"
 version = "0.1.0"
-description = "ACP environment for agentic Triton compiler optimization experiments."
+description = "Plug-and-play optimization core with agentic Triton + Inductor integrations."
 readme = "README.md"
 requires-python = ">=3.11"
+# The base install only carries what the core (`src/compilagent/`) needs.
+# Every integration ships in its own optional extra below.
 dependencies = [
-    "claude-agent-sdk>=0.1.68",
     "pydantic>=2.7",
-    "pydantic-ai-slim[anthropic]==1.83.0",
     "python-dotenv>=1.0.1",
     "typing-extensions>=4.12.0",
 ]
 
 [project.optional-dependencies]
-dev = ["fastapi>=0.115", "pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
+# --- per-integration extras ---
+# Triton compiler backend
+triton = ["torch>=2.11", "triton>=3.0"]
+# torch.compile / Inductor backend
+inductor = ["torch>=2.11"]
+# pydantic-ai harness (default LLM agent runtime)
+pydantic-ai = ["pydantic-ai-slim[anthropic,mistral,openai]==1.83.0"]
+# Claude Agent SDK harness
+claude-sdk = ["claude-agent-sdk>=0.1.68"]
+# pydantic-acp server shim
+acp = ["pydantic-acp>=0.9.0"]
+# Observation FastAPI + SPA
+ui = ["fastapi>=0.115", "uvicorn>=0.30", "websockets>=12"]
+# Convenience: everything (mirrors a CUDA-equipped dev box)
+all = [
+    "torch>=2.11",
+    "torchvision>=0.20",
+    "triton>=3.0",
+    "numpy>=2.0",
+    "pydantic-ai-slim[anthropic,mistral,openai]==1.83.0",
+    "claude-agent-sdk>=0.1.68",
+    "pydantic-acp>=0.9.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "websockets>=12",
+]
+
+# --- developer / experiment extras ---
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6"]
 gpu = ["numpy>=2.0", "torch>=2.11", "torchvision>=0.20"]
-observe = ["fastapi>=0.115", "uvicorn>=0.30", "websockets>=12"]
 
 [project.scripts]
+# Legacy entry points (will be retired with `compilagent_triton/`):
 compilagent-triton = "compilagent_triton.agent:main"
 compilagent-observe = "compilagent_triton.observation_server:main"
+
+[project.entry-points."compilagent.integrations"]
+# Phase-2 integrations register themselves under this group.
+# The core's `load_entry_point_integrations()` imports each module name listed
+# here at session bootstrap, which fires the integration's registry side
+# effects. Out-of-tree third parties advertise the same group from their own
+# pyproject.
+triton = "compilagent.integrations.triton"
+torch_inductor = "compilagent.integrations.torch_inductor"
+python = "compilagent.integrations.python"
+pydantic_ai = "compilagent.integrations.pydantic_ai"
+claude_agent_sdk = "compilagent.integrations.claude_agent_sdk"
+pydantic_acp = "compilagent.integrations.pydantic_acp"
+observation_ui = "compilagent.integrations.observation_ui"
 
 [build-system]
 requires = ["hatchling"]
