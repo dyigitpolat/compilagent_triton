@@ -258,6 +258,54 @@ import. The `examples/__init__.py` wraps each per-module import in
 `contextlib.suppress(Exception)` so a single broken demo doesn't take the
 others down.
 
+#### Triton kernel demos — two extra requirements
+
+The Triton compile harness imports the kernel module by file path and
+looks up `metadata["kernel_symbol"]` as a **module-level attribute**, then
+invokes a `<kernel>.compilagent_compile(meta)` hook to perform one real
+launch (a bare `@triton.jit` raises `Cannot call @triton.jit'd outside of
+the scope of a kernel` if called as a plain function). So every Triton
+demo must:
+
+1. Define the `@triton.jit def my_kernel(...)` at **module top level**,
+   wrapped in a `try: import triton` guard so the module remains
+   importable on triton-less boxes:
+
+   ```python
+   try:
+       import triton
+       import triton.language as tl
+   except ImportError:
+       triton = None
+       tl = None
+
+   if triton is not None:
+       @triton.jit
+       def my_kernel(...): ...
+   ```
+
+2. Attach a `compilagent_compile(meta)` hook on the kernel that performs
+   one real launch and returns the kernel handle:
+
+   ```python
+   if triton is not None:
+       def _compile_my_kernel(meta: dict) -> object:
+           import torch
+           if not torch.cuda.is_available():
+               raise RuntimeError("CUDA not available.")
+           # ... allocate inputs, launch via my_kernel[grid](...) ...
+           return handle
+
+       my_kernel.compilagent_compile = _compile_my_kernel
+   ```
+
+   The hook receives `meta` containing the agent's chosen launch
+   parameters (e.g. `BLOCK_SIZE`, `num_warps`); merge it on top of your
+   defaults before launching. Users invoking `optimize_kernel(my_kernel,
+   args=..., grid=..., constexpr=...)` from the Python entry point do
+   **not** write this hook themselves — `optimize_kernel` auto-attaches
+   one synthesised from `(args, grid, constexpr)`.
+
 The decorator registers `(spec, builder)` in the global
 `workload_registry`. The session calls `registry.build(workload_id)` to
 materialise an instance per run.
@@ -329,11 +377,19 @@ Pass the instance into `OptimizationSession(policy=...)`.
 
 ## Slot 6: `ToolDecl` — backend-specific agent tools
 
+`ToolDecl.handler` is a typed callable; harness adapters that introspect
+Python signatures (pydantic-ai) consume it directly, while the Claude SDK
+MCP bridge goes through `ToolDecl.invoke(args_dict)` which validates the
+wire-shaped dict against `args_model` (when set) before calling the
+handler with typed kwargs.
+
+### Simple no-args tool
+
 ```python
 from compilagent import ToolDecl
 
 def list_introspection_tools(self):
-    def _list_my_passes(_args: dict) -> str:
+    def list_my_passes() -> str:
         return json.dumps(["my_pass_a", "my_pass_b"])
 
     return (
@@ -341,17 +397,51 @@ def list_introspection_tools(self):
             name="list_my_passes",
             description="List the optimisation passes the my_backend supports.",
             args_schema={"type": "object", "properties": {}, "additionalProperties": False},
-            handler=_list_my_passes,
+            handler=list_my_passes,
             read_only=True,
         ),
     )
 ```
 
+### Typed-args tool — recommended for anything non-trivial
+
+Define a Pydantic input model so the agent sees a real JSON Schema
+(nested arrays, structured payloads, defaults) and the model emits
+well-formed JSON without escape pyramids. Pass the model as
+`args_model=`; `ToolDecl.invoke` validates the wire dict for you.
+
+```python
+from pydantic import BaseModel, Field
+from compilagent import ToolDecl
+
+class DescribeMyPassArgs(BaseModel):
+    name: str = Field(description="Pass name. See list_my_passes.")
+    verbose: bool = False
+
+def describe_my_pass(*, name: str, verbose: bool = False) -> str:
+    info = _PASS_TABLE[name]
+    return json.dumps(info if verbose else {"name": name, "stage": info["stage"]})
+
+ToolDecl(
+    name="describe_my_pass",
+    description="Describe one optimisation pass.",
+    args_schema=DescribeMyPassArgs.model_json_schema(),
+    handler=describe_my_pass,
+    args_model=DescribeMyPassArgs,
+    read_only=True,
+)
+```
+
+Handlers may raise `ValueError` to signal bad input; adapters translate
+that into the harness's native retry / error response. Pydantic
+`ValidationError`s are caught by `ToolDecl.invoke` and re-raised as
+`ValueError` for the same path.
+
 Names must not collide with the canonical 8 session tools
 (`inspect_workload`, `inspect_search_space`, `propose_candidate`,
 `propose_candidates`, `run_candidate`, `run_candidates`,
 `synthesize_findings`, `compare_runs`). The session calls
-`Toolset.with_extra(...)` to merge.
+`Toolset.with_extra(...)` to merge backend-supplied tools onto its own.
 
 ## Slot 7: `ObservationSink` — a custom event destination
 

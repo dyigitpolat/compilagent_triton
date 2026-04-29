@@ -47,6 +47,14 @@ const state = {
   // "done" if both events fire (the server emits session.finished after
   // session.failed during a finalize). Cleared on `attachToRun`.
   runFinalStatus: null,
+
+  // Timeline auto-follow: true iff the timeline should keep itself pinned
+  // to the tail. Flipped off when the user manually scrolls away from the
+  // bottom; flipped on again when they scroll back to the bottom (or click
+  // the "New events" pill).
+  autoFollow: true,
+  newEventCount: 0,
+  programmaticScroll: false,
 };
 
 // ----------------------------------------------------------------- DOM refs
@@ -77,6 +85,7 @@ const ui = {
 
   timeline: $("timeline"),
   btnClear: $("btn-clear"),
+  btnNewEvents: $("btn-new-events"),
 
   tblLeaderboard: $("tbl-leaderboard").querySelector("tbody"),
   listArtifacts: $("list-artifacts"),
@@ -340,6 +349,8 @@ ui.btnClear.addEventListener("click", () => {
   ui.tblLeaderboard.innerHTML = "";
   ui.listArtifacts.innerHTML = "";
   ui.artifactPreview.hidden = true;
+  state.autoFollow = true;
+  hideNewEventsPill();
 });
 
 // ----------------------------------------------------------------- websocket
@@ -421,6 +432,74 @@ function finalizeRun(status) {
 
 // ----------------------------------------------------------------- timeline
 
+// Pixel slack used to decide "is the user effectively at the bottom?"
+// Browsers can leave a sub-pixel gap after smooth scrolls; 4px absorbs that.
+const SCROLL_BOTTOM_EPS = 4;
+
+function isTimelineAtBottom() {
+  const t = ui.timeline;
+  return t.scrollHeight - t.scrollTop - t.clientHeight <= SCROLL_BOTTOM_EPS;
+}
+
+function scrollTimelineToBottom(smooth) {
+  state.programmaticScroll = true;
+  if (smooth) {
+    ui.timeline.scrollTo({ top: ui.timeline.scrollHeight, behavior: "smooth" });
+    // `scrollend` is the clean signal; fall back to a timeout for browsers
+    // that haven't shipped it yet so we don't get stuck ignoring real user
+    // scrolls.
+    const done = () => {
+      state.programmaticScroll = false;
+      ui.timeline.removeEventListener("scrollend", done);
+    };
+    ui.timeline.addEventListener("scrollend", done, { once: true });
+    setTimeout(() => { state.programmaticScroll = false; }, 600);
+  } else {
+    ui.timeline.scrollTop = ui.timeline.scrollHeight;
+    requestAnimationFrame(() => { state.programmaticScroll = false; });
+  }
+}
+
+function showNewEventsPill() {
+  state.newEventCount += 1;
+  const label = ui.btnNewEvents.querySelector(".new-events-label");
+  if (label) {
+    label.textContent = state.newEventCount === 1
+      ? "New event"
+      : `${state.newEventCount} new events`;
+  }
+  ui.btnNewEvents.hidden = false;
+}
+
+function hideNewEventsPill() {
+  state.newEventCount = 0;
+  ui.btnNewEvents.hidden = true;
+}
+
+function followTimeline({ smooth, isNewCard }) {
+  if (state.autoFollow) {
+    scrollTimelineToBottom(smooth);
+  } else if (isNewCard) {
+    showNewEventsPill();
+  }
+}
+
+ui.timeline.addEventListener("scroll", () => {
+  if (state.programmaticScroll) return;
+  if (isTimelineAtBottom()) {
+    state.autoFollow = true;
+    hideNewEventsPill();
+  } else {
+    state.autoFollow = false;
+  }
+});
+
+ui.btnNewEvents.addEventListener("click", () => {
+  state.autoFollow = true;
+  hideNewEventsPill();
+  scrollTimelineToBottom(false);
+});
+
 function appendCard(kindClass, kindLabel, body, ts) {
   const card = document.createElement("div");
   card.className = `card ${kindClass}`;
@@ -433,7 +512,7 @@ function appendCard(kindClass, kindLabel, body, ts) {
   else if (body) bodyEl.appendChild(body);
   card.append(head, bodyEl);
   ui.timeline.appendChild(card);
-  ui.timeline.scrollTop = ui.timeline.scrollHeight;
+  followTimeline({ smooth: true, isNewCard: true });
   return { card, body: bodyEl };
 }
 
@@ -591,7 +670,10 @@ function extendStream(kind, ev, text) {
   }
   if (entry && text) {
     entry.body.textContent += text;
-    ui.timeline.scrollTop = ui.timeline.scrollHeight;
+    // Streaming deltas: snap (no smooth) so text "tail-follows" without
+    // animation jitter. Don't show the New-events pill — the streaming
+    // card is already visible above.
+    followTimeline({ smooth: false, isNewCard: false });
   }
 }
 

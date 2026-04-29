@@ -116,13 +116,33 @@ def _execute_compile(spec: KernelSpec, meta: dict[str, Any]) -> Any:
 def _load_module(path: Path) -> Any:
     """Load a kernel module by path.
 
-    If the path lives inside an installed Python package, prefer
-    `importlib.import_module(<package>.<name>)` so relative imports keep
-    working. Otherwise fall back to spec_from_file_location with the parent
-    directory placed on sys.path.
+    Resolution order:
+
+    1. **Already-loaded module sharing the same file path.** If the user
+       imported the script themselves (e.g. `import my_demo` in a
+       quickstart) we reuse that module instance. Otherwise the harness
+       would load a fresh synthetic module with its own JITFunction
+       objects, and any state the caller attached to its copy of the
+       kernel (e.g. an auto-attached `compilagent_compile` hook from
+       `optimize_kernel`) would be invisible to the harness-side kernel.
+    2. Path inside an installed package → `importlib.import_module(...)`
+       so relative imports keep working.
+    3. Stand-alone script → `spec_from_file_location` with the parent
+       directory placed on `sys.path` for the duration of the load.
     """
 
     resolved = path.resolve()
+
+    for mod in list(sys.modules.values()):
+        mod_file = getattr(mod, "__file__", None)
+        if not mod_file:
+            continue
+        try:
+            if Path(mod_file).resolve() == resolved:
+                return mod
+        except (OSError, ValueError):
+            continue
+
     package_qualname = _resolve_package_module_name(resolved)
     if package_qualname is not None:
         return importlib.import_module(package_qualname)

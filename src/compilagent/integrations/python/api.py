@@ -288,6 +288,16 @@ def optimize_kernel(
         max_seconds=float(settings.max_benchmark_seconds),
     )
 
+    # The Triton compile harness imports the kernel module by file path
+    # and looks up the kernel symbol; it then tries to *invoke* it as part
+    # of `_execute_compile`. A bare `@triton.jit` raises `Cannot call
+    # @triton.jit'd outside of the scope of a kernel` if called directly.
+    # The harness's escape hatch is a `<kernel>.compilagent_compile(meta)`
+    # attribute that performs one real launch and returns the kernel
+    # handle. Auto-attach it from `(args, grid, constexpr)` so users
+    # following the quickstart never have to write that hook themselves.
+    _attach_compile_hook(kernel, args=args, grid=grid, constexpr=constexpr or {})
+
     @workload_registry_register(spec)
     def _build(_spec: WorkloadSpec) -> WorkloadInstance:
         return WorkloadInstance(
@@ -459,3 +469,53 @@ def _kernel_source_path(kernel: Any) -> str | None:
             return inspect.getsourcefile(inner) if inner is not None else None
         except Exception:  # noqa: BLE001
             return None
+
+
+def _attach_compile_hook(
+    kernel: Any,
+    *,
+    args: tuple[Any, ...],
+    grid: Callable[[dict[str, Any]], tuple[int, ...]],
+    constexpr: dict[str, Any],
+) -> None:
+    """Auto-attach a `compilagent_compile(meta)` hook on a user JIT kernel.
+
+    The hook performs one real launch using the same `args` + `constexpr`
+    the user passed to `optimize_kernel`, with the agent's `meta` overlay
+    on top so backend pass interventions can vary `BLOCK_SIZE`,
+    `num_warps`, etc. without the user having to write the hook by hand.
+
+    Idempotent: a kernel that already exposes `compilagent_compile` is
+    left untouched (callers that want richer behaviour can attach their
+    own hook before calling `optimize_kernel`).
+    """
+
+    if getattr(kernel, "compilagent_compile", None) is not None:
+        return
+
+    def _hook(meta: dict[str, Any]) -> Any:
+        merged: dict[str, Any] = dict(constexpr or {})
+        merged.update(meta or {})
+        # `num_warps`/`num_stages` are launcher-side knobs (not constexpr),
+        # so we pull them out of the merged dict and pass via kwargs.
+        launch_kwargs: dict[str, Any] = {}
+        for knob in ("num_warps", "num_stages", "maxnreg"):
+            if knob in merged:
+                launch_kwargs[knob] = merged.pop(knob)
+        handle = kernel[grid(merged)](*args, **merged, **launch_kwargs)
+        try:
+            import torch  # type: ignore[import-not-found]
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+        return handle
+
+    # Some kernel objects refuse arbitrary attributes; fall through
+    # silently. The user can attach the hook themselves on the
+    # underlying `kernel.fn` in that case.
+    import contextlib
+
+    with contextlib.suppress(AttributeError, TypeError):
+        kernel.compilagent_compile = _hook
