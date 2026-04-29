@@ -1,9 +1,0 @@
-[submodule "acpkit"]
-	path = acpkit
-	url = https://github.com/vcoderun/acpkit
-[submodule "triton"]
-	path = triton
-	url = https://github.com/triton-lang/triton
-[submodule "code-mode"]
-	path = code-mode
-	url = https://github.com/universal-tool-calling-protocol/code-mode
