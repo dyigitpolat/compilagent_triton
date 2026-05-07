@@ -2,7 +2,7 @@
   "harness": "pydantic_ai",
   "model_id": "mistral:mistral-large-latest",
   "max_candidates_per_workload": 3,
-  "elapsed_seconds": 153.2952716909349,
+  "elapsed_seconds": 153.29486675187945,
   "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
   "ordering": [
     {
