@@ -15,6 +15,7 @@ from compilagent.core.analysis import (
     CompileResult,
     CorrectnessResult,
     DeviceCapability,
+    Objective,
     PassCallback,
     TimingResult,
 )
@@ -435,6 +436,208 @@ def test_run_candidates_aggregates_results(tmp_path: Path, _registered_workload)
     assert summary["ran"] == 2
     assert summary["successful"] == 2
     assert summary["best"] is not None
+
+
+def test_default_backend_emits_no_objectives_event(tmp_path: Path, _registered_workload):
+    """A backend that does not override ``objectives_for_candidate`` keeps
+    the leaderboard's ``objectives`` field empty and never fires
+    ``EventKind.OBJECTIVES_RECORDED``. The default surface must remain
+    exactly as it was for single-axis backends."""
+
+    backend_registry.register("fake", _FakeBackend)
+    workspace = OptimizationWorkspace(session_cwd=tmp_path)
+    sink = CapturingSink()
+    session = OptimizationSession(
+        workload_id="fake_workload",
+        run_id="run-no-mo",
+        workspace=workspace,
+        sink=sink,
+        max_candidates=1,
+    )
+
+    harness = _FakeHarness()
+    request = HarnessRunRequest(
+        toolset=session.toolset,
+        system_instructions="be brief",
+        user_prompt="optimise me",
+        model_id="fake:fake-1",
+    )
+    asyncio.run(run_session(session=session, harness=harness, request=request))
+
+    assert EventKind.OBJECTIVES_RECORDED.value not in sink.kinds()
+    rows = json.loads(session.compare_runs())
+    for row in rows:
+        # Every row carries the field but it stays empty for single-axis backends.
+        assert row["objectives"] == {}
+
+
+# ---------------------------------------------------- multi-objective backend
+
+
+@dataclass
+class _MultiObjectiveBackend(_FakeBackend):
+    """Same as ``_FakeBackend`` but emits two objectives per candidate."""
+
+    id: str = "fake_mo"
+
+    def objectives_for_candidate(
+        self,
+        workload: WorkloadSpec,
+        plan: Plan,
+        compile_result: CompileResult,
+        timing_result: TimingResult | None,
+    ):
+        median = timing_result.median_ms if timing_result else 0.0
+        # Synthetic accuracy proxy: payloads of "on" -> 0.95, anything else 0.5.
+        on_count = sum(
+            1
+            for iv in plan.interventions
+            if iv.target.kind == "knob" and iv.payload == "on"
+        )
+        accuracy = 0.95 if on_count else 0.5
+        return {
+            "median_ms": Objective(
+                name="median_ms", value=float(median or 0.0), goal="min", unit="ms",
+            ),
+            "accuracy": Objective(
+                name="accuracy", value=float(accuracy), goal="max", unit="",
+            ),
+        }
+
+
+def test_multi_objective_backend_populates_leaderboard_and_event(
+    tmp_path: Path, _registered_workload
+):
+    """When the backend overrides ``objectives_for_candidate`` the session:
+    (1) attaches the serialized objectives onto each leaderboard row,
+    (2) emits one ``OBJECTIVES_RECORDED`` event per successful candidate,
+    (3) round-trips the same dict through ``compare_runs`` and ``finalize``."""
+
+    # Use a different id so this test does not collide with other suites
+    # that pre-register the single-axis backend under "fake".
+    backend = _MultiObjectiveBackend()
+    try:
+        backend_registry.register("fake_mo", lambda: backend)
+    except ValueError:
+        pass  # registry already populated by a sibling test
+
+    spec = WorkloadSpec(
+        id="fake_workload_mo",
+        title="Fake MO workload",
+        description="Multi-objective synthetic",
+        kind=WorkloadKind.KERNEL,
+        backend_id="fake_mo",
+        tolerance=ToleranceConfig(atol=1e-6, rtol=1e-6),
+        budget=BenchmarkBudget(warmup=1, repetitions=3, max_seconds=1.0),
+    )
+
+    @register_workload(spec)
+    def _build(s: WorkloadSpec) -> WorkloadInstance:
+        return WorkloadInstance(spec=s, forward=lambda: None)
+
+    workspace = OptimizationWorkspace(session_cwd=tmp_path)
+    sink = CapturingSink()
+    session = OptimizationSession(
+        workload_id="fake_workload_mo",
+        run_id="run-mo",
+        workspace=workspace,
+        sink=sink,
+        max_candidates=1,
+    )
+    harness = _FakeHarness()
+    request = HarnessRunRequest(
+        toolset=session.toolset,
+        system_instructions="multi-objective",
+        user_prompt="optimise me",
+        model_id="fake:fake-1",
+    )
+    asyncio.run(run_session(session=session, harness=harness, request=request))
+
+    objectives_events = [
+        e for e in sink.events if e.kind == EventKind.OBJECTIVES_RECORDED.value
+    ]
+    assert len(objectives_events) == 1
+    payload = objectives_events[0].payload
+    assert payload["candidate_id"] != "baseline"
+    assert set(payload["objectives"]) == {"median_ms", "accuracy"}
+    assert payload["objectives"]["median_ms"]["goal"] == "min"
+    assert payload["objectives"]["median_ms"]["unit"] == "ms"
+    assert payload["objectives"]["accuracy"]["goal"] == "max"
+    assert payload["objectives"]["accuracy"]["value"] == pytest.approx(0.95)
+
+    rows = json.loads(session.compare_runs())
+    candidate_row = next(r for r in rows if r["candidate_id"] != "baseline")
+    assert candidate_row["objectives"]["accuracy"]["value"] == pytest.approx(0.95)
+    assert candidate_row["objectives"]["median_ms"]["unit"] == "ms"
+
+    # Baseline rows still have an empty objectives dict (no candidate plan ran).
+    baseline_row = next(r for r in rows if r["candidate_id"] == "baseline")
+    assert baseline_row["objectives"] == {}
+
+    # New multi-objective tools should surface the candidate's full
+    # objective tuple — query_top_candidates honours goal direction,
+    # pareto_front + metric_summary roll up across the population.
+    top_acc = json.loads(session.query_top_candidates(metric="accuracy", top_k=3))
+    assert top_acc["metric"] == "accuracy"
+    assert top_acc["ranked"][0]["candidate_id"] != "baseline"
+    assert top_acc["ranked"][0]["rank"] == 1
+    assert top_acc["ranked"][0]["goal"] == "max"
+
+    front = json.loads(session.pareto_front())
+    assert front["pareto_size"] == 1
+    assert front["front"][0]["candidate_id"] != "baseline"
+    assert "accuracy" in front["front"][0]["objectives"]
+
+    summary = json.loads(session.metric_summary())
+    assert set(summary["metrics"]) == {"accuracy", "median_ms"}
+    assert summary["metrics"]["accuracy"]["best"]["value"] == pytest.approx(0.95)
+
+    # `run_candidate` JSON return now includes the per-candidate objectives
+    # dict (additive change). Replay one of the tool results captured by the
+    # CapturingSink to assert it carries the new field.
+    run_result = json.loads(session.compare_runs())  # already done above; use fresh
+    # Direct check on the candidate dict — same payload that run_candidate
+    # serializes back to the agent.
+    cid = next(iter(session.candidates))
+    assert session.candidates[cid]["objectives"]["accuracy"]["value"] == pytest.approx(0.95)
+
+    episode = session.finalize()
+    cand_episode_row = next(
+        r for r in episode["leaderboard"] if r["candidate_id"] != "baseline"
+    )
+    assert cand_episode_row["objectives"]["accuracy"]["value"] == pytest.approx(0.95)
+
+
+def test_run_candidate_json_includes_objectives_field(tmp_path: Path, _registered_workload):
+    """`run_candidate`'s JSON return now carries the multi-objective `objectives`
+    dict (empty for single-axis backends, populated when the backend
+    implements `objectives_for_candidate`)."""
+
+    backend_registry.register("fake", _FakeBackend)
+    workspace = OptimizationWorkspace(session_cwd=tmp_path)
+    session = OptimizationSession(
+        workload_id="fake_workload",
+        run_id="run-obj-field",
+        workspace=workspace,
+        sink=CapturingSink(),
+        max_candidates=2,
+    )
+    from compilagent.session.inputs import InterventionInput
+    propose_json = session.propose_candidate(
+        interventions=[
+            InterventionInput(
+                target_kind="knob", target_selector="optimize", payload="on",
+            )
+        ],
+        description="check objectives field",
+    )
+    cid = json.loads(propose_json)["id"]
+    run_json = json.loads(session.run_candidate(candidate_id=cid))
+    # Single-axis backend (`_FakeBackend` does not override
+    # `objectives_for_candidate`) -> objectives is an empty dict, NOT
+    # absent. The agent always sees the key.
+    assert "objectives" in run_json
+    assert run_json["objectives"] == {}
 
 
 def test_run_session_surfaces_harness_error_in_session_failed_payload(

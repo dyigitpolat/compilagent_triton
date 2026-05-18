@@ -71,6 +71,11 @@ from .completion import (
 )
 from .inputs import InterventionInput, PlanInput
 from .leaderboard import best_validated_candidate, build_leaderboard
+from .multi_objective import (
+    metric_summary as _metric_summary,
+    pareto_front as _pareto_front,
+    rank_by_metric as _rank_by_metric,
+)
 from .tools import build_session_toolset
 
 
@@ -586,19 +591,62 @@ class OptimizationSession:
             else None
         )
 
+        objectives_map: dict[str, dict[str, Any]] = {}
+        try:
+            raw_objectives = self.backend.objectives_for_candidate(
+                self.spec, plan, compile_outcome, timing
+            )
+        except Exception as exc:  # noqa: BLE001
+            raw_objectives = {}
+            self.sink.emit_kv(
+                EventKind.LOG_LINE,
+                payload={
+                    "level": "warn",
+                    "message": f"objectives_for_candidate raised: {exc!r}",
+                },
+                run_id=self.run_id,
+                candidate_id=candidate_id,
+            )
+        if raw_objectives:
+            for name, obj in raw_objectives.items():
+                if hasattr(obj, "serialize"):
+                    objectives_map[str(name)] = obj.serialize()
+                elif isinstance(obj, Mapping):
+                    objectives_map[str(name)] = dict(obj)
+                else:
+                    # Backends may return plain numbers; coerce to the
+                    # canonical serialized shape so consumers see a uniform
+                    # `{value, goal, unit}` tuple.
+                    objectives_map[str(name)] = {
+                        "name": str(name),
+                        "value": float(obj),
+                        "goal": "min",
+                        "unit": "",
+                    }
+
         c.update(
             {
                 "compile": compile_outcome,
                 "timing": timing,
                 "correctness": correctness,
                 "speedup": speedup,
+                "objectives": objectives_map,
             }
         )
 
+        # Success: compile ok + correctness ok + at least one signal the
+        # session can sort/compare on. Single-axis backends signal
+        # ``timing.median_ms is not None``; multi-objective backends
+        # leave ``median_ms`` blank and signal via the ``objectives``
+        # map populated from ``Backend.objectives_for_candidate(...)``.
+        # Either path counts.
+        has_signal = (
+            (timing is not None and timing.median_ms is not None)
+            or bool(objectives_map)
+        )
         successful = bool(
             compile_outcome.ok
-            and timing
-            and timing.median_ms is not None
+            and has_signal
             and (correctness is None or correctness.ok)
         )
         if successful:
@@ -622,6 +670,18 @@ class OptimizationSession:
             },
             candidate_id=candidate_id,
         )
+        if objectives_map:
+            # Multi-objective backends rebroadcast the full per-axis dict so
+            # external sinks (e.g. mimarsinan's MultiObjectiveSink) can
+            # reconstruct a Pareto front without scraping the leaderboard.
+            self._emit(
+                EventKind.OBJECTIVES_RECORDED,
+                payload={
+                    "candidate_id": candidate_id,
+                    "objectives": objectives_map,
+                },
+                candidate_id=candidate_id,
+            )
         self._emit(
             EventKind.RUN_PROGRESS,
             payload={
@@ -653,6 +713,7 @@ class OptimizationSession:
                                     else None
                                 ),
                                 "rationale": cc.get("rationale", ""),
+                                "objectives": cc.get("objectives") or {},
                             }
                             for cid, cc in self.candidates.items()
                         ],
@@ -724,6 +785,11 @@ class OptimizationSession:
                 "failed_attempts": self.budget_state["failed_attempts"],
                 "slots_remaining": slots_remaining,
                 "hint": hint,
+                # Multi-objective backends populate this via
+                # `Backend.objectives_for_candidate(...)`; single-axis
+                # backends keep it as an empty dict, which the agent can
+                # ignore.
+                "objectives": objectives_map,
             },
             indent=2,
             default=str,
@@ -833,11 +899,124 @@ class OptimizationSession:
                         c.get("correctness").ok if c.get("correctness") else None
                     ),
                     "rationale": c.get("rationale", ""),
+                    "objectives": c.get("objectives") or {},
                 }
                 for cid, c in self.candidates.items()
             ],
         )
         return json.dumps([row.serialize() for row in rows], indent=2, default=str)
+
+    # --------------------------------------------------- multi-objective surface
+    # These four tools are meaningful when the backend opts into the
+    # multi-objective surface via `Backend.objectives_for_candidate`.
+    # Single-axis backends (Triton, Inductor) leave `objectives` empty,
+    # in which case every helper returns an empty result and the agent
+    # falls back to `compare_runs` (sorted by `median_ms`).
+
+    def _objective_rows(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "candidate_id": cid,
+                "objectives": c.get("objectives") or {},
+            }
+            for cid, c in self.candidates.items()
+            if (c.get("objectives") or {})
+        ]
+
+    def query_top_candidates(self, *, metric: str, top_k: int = 5) -> str:
+        """Return up to ``top_k`` candidates sorted by one objective.
+
+        Honours the metric's goal direction (max/min) recorded in each
+        candidate's serialized `Objective` payload. Returns an empty list
+        when no candidate has recorded objectives or the metric is
+        unknown.
+        """
+
+        rows = self._objective_rows()
+        ranked = _rank_by_metric(rows, metric, top_k=int(top_k))
+        return json.dumps(
+            {"metric": metric, "ranked": ranked}, indent=2, default=str,
+        )
+
+    def pareto_front(self) -> str:
+        """Return the non-dominated subset across all active objectives.
+
+        Each row carries its `candidate_id` and full `objectives` dict so
+        the agent can compare trade-offs. Falls back to all candidates
+        with non-empty objectives when fewer than two have scored — there
+        is nothing to dominate yet.
+        """
+
+        rows = self._objective_rows()
+        front = _pareto_front(rows)
+        # Enrich with the registered plan description so the agent can
+        # remember what each Pareto member actually proposed.
+        enriched: list[dict[str, Any]] = []
+        for row in front:
+            cid = str(row.get("candidate_id") or "")
+            cand = self.candidates.get(cid) or {}
+            enriched.append({
+                "candidate_id": cid,
+                "objectives": row.get("objectives") or {},
+                "description": cand.get("description") or "",
+                "rationale": cand.get("rationale") or "",
+            })
+        return json.dumps(
+            {
+                "pareto_size": len(enriched),
+                "front": enriched,
+            },
+            indent=2,
+            default=str,
+        )
+
+    def metric_summary(self) -> str:
+        """Return per-objective best/worst/median across all candidates."""
+
+        rows = self._objective_rows()
+        summary = _metric_summary(rows)
+        return json.dumps({"metrics": summary}, indent=2, default=str)
+
+    def compare_candidates(
+        self,
+        *,
+        candidate_ids: list[str],
+        metrics: list[str] | None = None,
+    ) -> str:
+        """Side-by-side objectives + descriptions for an explicit set of candidates.
+
+        ``metrics`` filters which axes appear (default: every metric that
+        any of the requested candidates scored on). Useful for digging
+        into the top-k of a particular axis returned by
+        ``query_top_candidates`` or members of the Pareto front.
+        """
+
+        if not candidate_ids:
+            raise ValueError("candidate_ids must be a non-empty list")
+        rows: list[dict[str, Any]] = []
+        for cid in candidate_ids:
+            cand = self.candidates.get(str(cid))
+            if cand is None:
+                rows.append({
+                    "candidate_id": str(cid),
+                    "error": "unknown candidate",
+                    "objectives": {},
+                })
+                continue
+            objs = cand.get("objectives") or {}
+            if metrics:
+                objs = {k: v for k, v in objs.items() if k in metrics}
+            rows.append({
+                "candidate_id": str(cid),
+                "description": cand.get("description") or "",
+                "rationale": cand.get("rationale") or "",
+                "objectives": objs,
+            })
+        return json.dumps(
+            {"candidates": rows, "metrics_filter": list(metrics or [])},
+            indent=2,
+            default=str,
+        )
 
     # --------------------------------------------------------------- finalisation
 
@@ -858,6 +1037,7 @@ class OptimizationSession:
                         c.get("correctness").ok if c.get("correctness") else None
                     ),
                     "rationale": c.get("rationale", ""),
+                    "objectives": c.get("objectives") or {},
                 }
                 for cid, c in self.candidates.items()
             ],

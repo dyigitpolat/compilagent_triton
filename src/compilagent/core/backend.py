@@ -31,7 +31,7 @@ no-op-defaultable methods. See `docs/integration_guide.md`.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -40,6 +40,7 @@ from .analysis import (
     CompileResult,
     CorrectnessResult,
     DeviceCapability,
+    Objective,
     PassCallback,
     TimingResult,
 )
@@ -225,6 +226,29 @@ class Backend(Protocol):
         """
         ...
 
+    def objectives_for_candidate(
+        self,
+        workload: WorkloadSpec,
+        plan: Plan,
+        compile_result: CompileResult,
+        timing_result: TimingResult | None,
+    ) -> Mapping[str, Objective]:
+        """Optional: return a multi-objective dictionary for one candidate.
+
+        Backends with a single objective (the canonical "speedup vs baseline"
+        case) return `{}` and the session falls back to its existing
+        single-axis leaderboard. Backends with multiple objectives (e.g.
+        joint NAS + hardware search reporting accuracy + latency +
+        utilisation simultaneously) return a `{name: Objective(...)}`
+        mapping; the session attaches it to the candidate's leaderboard row
+        and emits `EventKind.OBJECTIVES_RECORDED` so external sinks can
+        reconstruct a Pareto front without scraping `profile_metrics`.
+
+        Default implementation returns an empty mapping; existing backends
+        and downstream consumers are unaffected.
+        """
+        ...
+
 
 class BackendBase:
     """Concrete base class with safe defaults for the optional `Backend` methods.
@@ -250,6 +274,7 @@ class BackendBase:
       - `list_introspection_tools` — empty tuple.
       - `list_artifact_renderers` — empty tuple.
       - `infer_workload_family` — `None`.
+      - `objectives_for_candidate` — empty mapping (single-axis leaderboard).
     """
 
     id: str = "base"
@@ -272,6 +297,15 @@ class BackendBase:
 
     def infer_workload_family(self, workload: WorkloadSpec) -> str | None:
         return None
+
+    def objectives_for_candidate(
+        self,
+        workload: WorkloadSpec,
+        plan: Plan,
+        compile_result: CompileResult,
+        timing_result: TimingResult | None,
+    ) -> Mapping[str, Objective]:
+        return {}
 
 
 class BackendRegistry:

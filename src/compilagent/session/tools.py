@@ -111,12 +111,17 @@ _TOOL_DESCRIPTIONS: dict[str, tuple[str, bool]] = {
     "run_candidate": (
         "Compile + time + correctness-check a previously proposed candidate. "
         "Returns median_ms, speedup_vs_baseline, correctness_ok, plus a "
-        "hint when the run failed.",
+        "hint when the run failed. Multi-objective backends additionally "
+        "populate `objectives` (a dict of named axes with goal directions); "
+        "single-axis backends leave it empty.",
         False,
     ),
     "run_candidates": (
         "Run a batch of previously proposed candidates in sequence and "
-        "return per-candidate results plus an aggregate summary.",
+        "return per-candidate results plus an aggregate summary. Each "
+        "per-candidate entry mirrors `run_candidate`'s response, "
+        "including the multi-objective `objectives` dict when the backend "
+        "populates it.",
         False,
     ),
     "synthesize_findings": (
@@ -127,7 +132,37 @@ _TOOL_DESCRIPTIONS: dict[str, tuple[str, bool]] = {
     ),
     "compare_runs": (
         "Return a leaderboard of (baseline + judged candidates) sorted by "
-        "median_ms ascending.",
+        "median_ms ascending. Each row also carries the multi-objective "
+        "`objectives` dict (empty for single-axis backends), so the agent "
+        "can see all axes at a glance.",
+        True,
+    ),
+    "query_top_candidates": (
+        "Multi-objective only: return the top-k candidates sorted by one "
+        "named objective, honouring its goal direction (max/min). Useful "
+        "for finding the leader in a single axis without enumerating "
+        "every row.",
+        True,
+    ),
+    "pareto_front": (
+        "Multi-objective only: return the non-dominated subset of "
+        "candidates across every active objective. Each row includes the "
+        "candidate's `objectives` dict and the registered plan "
+        "description so the agent can reason about trade-offs.",
+        True,
+    ),
+    "metric_summary": (
+        "Multi-objective only: return per-objective best/worst/median "
+        "across all candidates with their corresponding candidate ids. "
+        "A quick way to see where the search has covered ground and "
+        "where it has not.",
+        True,
+    ),
+    "compare_candidates": (
+        "Multi-objective only: return side-by-side objectives + "
+        "descriptions for an explicit list of candidate ids. Use to "
+        "compare the top-k of one metric against the top-k of another, "
+        "or to inspect specific Pareto front members.",
         True,
     ),
 }

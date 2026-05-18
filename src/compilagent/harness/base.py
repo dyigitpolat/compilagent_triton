@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from compilagent._compat import StrEnum
 from compilagent.toolset import Toolset
 
 if TYPE_CHECKING:

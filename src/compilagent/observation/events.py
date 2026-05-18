@@ -16,10 +16,11 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from time import time
 from typing import Any
+
+from compilagent._compat import StrEnum
 
 
 class EventKind(StrEnum):
@@ -44,6 +45,7 @@ class EventKind(StrEnum):
     RUN_PROGRESS = "run.progress"
     RUN_CONTINUATION = "run.continuation"
     LEADERBOARD_UPDATED = "leaderboard.updated"
+    OBJECTIVES_RECORDED = "objectives.recorded"
 
     AGENT_THINKING_STARTED = "agent.thinking.started"
     AGENT_THINKING_DELTA = "agent.thinking.delta"

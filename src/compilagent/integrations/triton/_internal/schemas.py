@@ -8,13 +8,16 @@ core sees (`compilagent.core.CompileResult`, `Analysis`, …) live in
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from compilagent._compat import StrEnum
+
+UTC = timezone.utc
 
 
 class DecisionKind(StrEnum):

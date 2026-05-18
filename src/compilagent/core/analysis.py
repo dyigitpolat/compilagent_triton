@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,3 +108,35 @@ class TimingResult:
     p80_ms: float | None
     profile_metrics: dict[str, Any] = field(default_factory=dict)
     diagnostics: str | None = None
+
+
+ObjectiveGoal = Literal["min", "max"]
+
+
+@dataclass(frozen=True, slots=True)
+class Objective:
+    """One named objective axis a backend reports for a candidate.
+
+    Multi-objective backends (e.g. neural-architecture / hardware co-search)
+    expose several axes per candidate via `Backend.objectives_for_candidate`;
+    the session round-trips them through the leaderboard and emits
+    `EventKind.OBJECTIVES_RECORDED` so external sinks can rebuild a Pareto
+    front without scraping `TimingResult.profile_metrics`.
+
+    `goal` carries the optimisation direction (`"min"` or `"max"`); `unit`
+    is a free string for display ("ms", "%", ""). The default leaderboard's
+    speedup column is unaffected — `Objective` is an additive surface.
+    """
+
+    name: str
+    value: float
+    goal: ObjectiveGoal = "min"
+    unit: str = ""
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "value": self.value,
+            "goal": self.goal,
+            "unit": self.unit,
+        }

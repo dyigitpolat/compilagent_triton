@@ -34,6 +34,39 @@ class IntRange:
 
 
 @dataclass(frozen=True, slots=True)
+class IntFreeform:
+    """An open integer axis with min/max bounds and no fixed candidate list.
+
+    Used when a backend wants the agent to propose *any* integer in
+    ``[min, max]`` (optionally snapped to ``step``) rather than picking
+    from a curated enumeration. The agent reads ``min``, ``max``,
+    ``step`` and chooses; the backend's ``validate_intervention`` rejects
+    out-of-range or non-step-aligned values with a clear retry message.
+
+    Compared to ``IntRange`` (which enumerates candidates), ``IntFreeform``
+    is the right choice when:
+      - the legal space is large enough that enumeration is wasteful, or
+      - the backend wants the agent to reason about scale (e.g. matching
+        chip capacity to workload footprint) rather than picking from a
+        hand-picked menu.
+    """
+
+    min: int
+    max: int
+    step: int = 1
+    units: str = ""
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "kind": "int_freeform",
+            "min": int(self.min),
+            "max": int(self.max),
+            "step": int(self.step),
+            "units": self.units,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class FloatRange:
     candidates: tuple[float, ...]
     units: str = ""
@@ -81,7 +114,9 @@ class StructuredJsonRange:
         }
 
 
-LeverRange = IntRange | FloatRange | EnumChoice | BooleanFlag | StructuredJsonRange
+LeverRange = (
+    IntRange | IntFreeform | FloatRange | EnumChoice | BooleanFlag | StructuredJsonRange
+)
 
 
 @dataclass(frozen=True, slots=True)

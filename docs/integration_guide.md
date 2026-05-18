@@ -127,6 +127,68 @@ class MyBackend(BackendBase):
 - **`infer_workload_family`** lets `CandidatePolicy` group similar
   workloads. Return `"matmul"`, `"reduction"`, etc., or `None`.
 
+### Multi-objective backends
+
+Some compile targets are inherently multi-objective: a neural-architecture
++ hardware co-search reports accuracy, latency, parameter utilisation,
+fragmentation, and sync barriers all at once; a scheduler optimisation may
+report median time *and* peak memory *and* energy. The session ships a
+single optional surface for exposing these axes alongside the default
+`speedup_vs_baseline` column:
+
+```python
+from collections.abc import Mapping
+
+from compilagent import Objective
+
+class MyMultiObjectiveBackend(BackendBase):
+    id = "my_backend"
+    artifact_stages = ("source", "asm")
+
+    # ... compile / time_workload / validate_correctness as usual ...
+
+    def objectives_for_candidate(
+        self, workload, plan, compile_result, timing_result,
+    ) -> Mapping[str, Objective]:
+        if timing_result is None:
+            return {}
+        m = timing_result.profile_metrics
+        return {
+            "median_ms": Objective(
+                name="median_ms", value=timing_result.median_ms or 0.0,
+                goal="min", unit="ms",
+            ),
+            "peak_memory_mb": Objective(
+                name="peak_memory_mb", value=float(m.get("peak_memory_mb", 0)),
+                goal="min", unit="MB",
+            ),
+            "accuracy": Objective(
+                name="accuracy", value=float(m.get("accuracy", 0.0)),
+                goal="max", unit="",
+            ),
+        }
+```
+
+What the session does with the returned mapping:
+
+- Stores the serialized form (`{name, value, goal, unit}`) on the
+  candidate's `LeaderboardRow.objectives` field.
+- Emits `EventKind.OBJECTIVES_RECORDED` immediately after
+  `BENCHMARK_COMPLETED`. Payload:
+  `{"candidate_id": "<id>", "objectives": {<name>: {value, goal, unit}, ...}}`.
+- Round-trips the same `objectives` dict through `compare_runs()` and
+  `finalize()`'s episode JSON.
+
+Single-axis backends do not implement `objectives_for_candidate`: the
+default in `BackendBase` returns `{}`, the leaderboard rows carry an
+empty `objectives` field, and no `OBJECTIVES_RECORDED` event fires.
+Existing integrations require zero changes.
+
+The contract stays additive: `Intervention.target.kind` is still a free
+string and `EventKind` is still open per the Phase-1 guarantees, so
+backends opt into the multi-objective surface without coupling to the
+rest of the core.
+
 ## Slot 2: `Harness` — a new agent runtime
 
 ```python
